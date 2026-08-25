@@ -6,6 +6,7 @@ and never copied into docs/.
 import json
 import os
 import subprocess
+import textwrap
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -133,14 +134,19 @@ def render(fname, meta, outdir=SPEC_OUT):
         ax.spines[s].set_visible(False)
     ax.tick_params(direction="out")
 
+    # Wrapped to the axes width: the caption is long enough to run off the
+    # canvas as a single line, which silently truncates it in the PNG.
     caption = (f"Songmeter Micro 2, {dur:.0f} s excerpt, {sr/1000:g} kHz mono. "
                f"Identified by ear; BirdNET logged "
                f"{meta['n_detections']:,} unvalidated detections of this "
                f"species at {meta['n_plots']} plots.")
-    fig.text(0.105, 0.015, caption, ha="left", va="bottom",
+    # Wrap width 72 measured against the rendered text extent at this figure
+    # size and font; wider values push the last line past the canvas edge.
+    fig.text(0.105, 0.015, "\n".join(textwrap.wrap(caption, 72)),
+             ha="left", va="bottom",
              fontsize=mpl.rcParams["legend.fontsize"], color="#444444")
 
-    fig.subplots_adjust(left=0.105, right=0.965, top=0.90, bottom=0.20)
+    fig.subplots_adjust(left=0.105, right=0.965, top=0.90, bottom=0.26)
 
     out = os.path.join(outdir, meta["clip_id"] + ".png")
     fig.savefig(out, dpi=DPI)
