@@ -68,29 +68,63 @@ Run it on any new image before it reaches `docs/`.
 
 ## Tracking BirdNET validation progress
 
-The prospectus calls for manually validating ~10% of classifications per species
-to estimate false-positive rates for the Doser et al. (2021) model AV. The
-pipeline computes each species' target and the dashboard shows progress against
-it. It currently reads 0%.
+**150 recordings are validated per species**, drawn *stratified across
+confidence bins*. A logistic regression of true-positive outcome on BirdNET
+confidence then gives the cutoff where P(true positive) = 0.95; detections at
+or above that cutoff are the positives carried into the multi-species occupancy
+model. Total workload: **11,730 validations** across 84 species. It currently
+reads 0%.
 
-To record progress, edit **`build/validation_log.csv`** and fill in two columns:
+To record progress, edit **`build/validation_log.csv`**. It has one row per
+species per confidence bin (641 rows), and you fill in two columns:
 
 | column | meaning |
 |---|---|
-| `n_checked` | how many detections of that species you have listened to |
+| `n_checked` | how many detections **in that confidence bin** you have listened to |
 | `n_true_positive` | how many of those were genuinely that species |
 
-Everything else in that file (`n_detections_conf25`, `validation_target`) is
-regenerated and can be left alone; `notes` is yours. On the next rebuild the
-dashboard shows per-species precision, percent of target, and an overall
-progress bar. Precision is `n_true_positive / n_checked` — the quantity the
-false-positive model needs.
+Everything else (`confidence_bin`, `n_available`, `target`) is regenerated and
+can be left alone; `notes` is yours. Counts you have entered are preserved
+across rebuilds, keyed on species + bin, so re-running the pipeline after new
+BirdNET output never discards validation work.
 
-The 10% target is calculated against detections at or above the liberal 0.25
-confidence threshold specified in the prospectus, which is a pool of 2,793,420
-detections (a 279,382-detection target). If that proves impractical, raise
-`VALIDATION_POOL_THRESHOLD` near the top of `build_summaries.py` and the targets
-shrink accordingly.
+### Why stratified, and what that costs
+
+Raw confidences are concentrated near the 0.25 floor (median 0.43, 25th
+percentile 0.28). A simple random 150 would therefore put almost nothing near
+the crossing point — for pickerel frog, about *one* of 150 draws would land at
+or above 0.90, and for Swainson's warbler 130 of 150 would fall below 0.40. The
+0.95 cutoff would be extrapolated rather than estimated.
+
+Allocating roughly 19 validations to each of eight bins from 0.25 to 1.0 puts
+data on both sides of the crossing. The cost is that **validated detections are
+no longer a random sample**, so the pooled true-positive rate over your
+validated clips is *not* the precision of the dataset. The dashboard therefore
+reports per-stratum rates and the fitted curve, and deliberately publishes no
+"overall precision" figure. The fitted curve is the object of interest, which
+is what the threshold approach needs anyway.
+
+A cutoff appears only once a species has validations in **at least two**
+confidence bins. Until then the table reads "not started". Where the fit runs
+but cannot identify a cutoff — precision not increasing with confidence, or
+0.95 never reached inside the confidence range — the table says "not
+identifiable" and the reason is in the tooltip and in `species[].fit.reason`.
+No number is invented in those cases.
+
+### Tuning the design
+
+Near the top of `build_summaries.py`:
+
+| constant | effect |
+|---|---|
+| `VALIDATION_N_PER_SPECIES` | validations per species (currently 150) |
+| `VALIDATION_TARGET_P` | target true-positive probability (currently 0.95) |
+| `VALIDATION_BIN_EDGES` | the confidence strata |
+| `VALIDATION_POOL_THRESHOLD` | the retained-detection floor (currently 0.25) |
+
+Changing bin edges rewrites the log's row set. Counts are matched on the bin
+label, so **keep a copy of the log before changing the edges** — rows whose
+label no longer exists are dropped.
 
 ## Adding the bat and vegetation views
 
@@ -122,7 +156,7 @@ The repository is already initialized and committed. To publish:
 
 ```bash
 cd /home/will/NCSU/Claude_Science/2026_Sensor_Dashboard
-git remote add origin https://github.com/<your-username>/<repo-name>.git
+git remote add origin https://github.com/harrodw/Timbermill_Data_Dashboard.git
 git branch -M main
 git push -u origin main
 ```
@@ -210,13 +244,19 @@ The dashboard surfaces these rather than hiding them; see `data_gaps` in
   camera view. Worth correcting at the source.
 - **`Spottie!.jpg`** is a spotted turtle (*Clemmys guttata*), not a spotted
   skunk, and is captioned accordingly.
-- **Spectrogram clips carry no species attribution.** The three example clips
-  (`_001_C##` filenames) do not appear anywhere in the BirdNET results, whose
-  `File` column names the ~60-minute parent recording. The clip offset within
-  the parent is unknown, so no detection can be honestly attributed to a
-  5-second excerpt. The panel shows parent-recording context instead, clearly
-  labelled. If you can export clips with their parent offset, real per-clip
-  attribution becomes possible.
+- **Audio clips carry no plot or date.** The five example clips are named for
+  the species they contain (`pine_warbler.wav`), and that identification —
+  yours, made by listening — is what the panel shows. But unlike the earlier
+  `SMM2-<unit>_<date>_<time>` exports, these filenames carry no recorder, plot
+  or timestamp, and the files hold no embedded metadata, so no location or date
+  is attributed to a clip. The context shown beside each is season-wide for the
+  species, labelled as such. Re-exporting with the recorder and timestamp in
+  the filename would let the panel name the plot and date again.
+
+  The species names are cross-checked against `birdnet.json` at build time: an
+  unrecognized filename is reported and skipped rather than published without a
+  Latin name. To add a clip, drop the WAV in `raw_data/Audio_Data/` and add its
+  filename stem to `CLIP_SPECIES` in `build/make_spectrograms.py`.
 
 ## Verification scripts
 

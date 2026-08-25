@@ -2,9 +2,16 @@
    validation.js -- BirdNET validation progress (bird_frog_audio only).
 
    Source: data/birdnet.json .validation (overall) and .species[] per-species
-   fields (n_detections, validation_target, n_validated, n_true_positive,
-   precision, pct_of_target). Progress is currently 0%; the empty state has to
-   read as "not started", not as an error or a missing panel.
+   fields. The design is a stratified sample of n per species across confidence
+   bins, with a logistic fit of P(true positive) on confidence giving the
+   cutoff at which P reaches the target; detections at or above it are the
+   positives carried into the occupancy model.
+
+   Two labelling rules matter here. (1) The validated sample is stratified, not
+   random, so the pooled true-positive rate over validated clips is a property
+   of the sample and must never be titled "precision" -- per-stratum rates and
+   the fitted curve are the interpretable quantities. (2) A species with no
+   identifiable cutoff shows why, not a blank or an invented number.
    ========================================================================== */
 
 import { $, el, clear, fmtInt, fmtNum, fmtPct, showPanelError, hidePanelError } from './data.js';
@@ -15,9 +22,9 @@ const COLUMNS = [
   { key: 'n_detections',     label: 'Detections' },
   { key: 'validation_target',label: 'Target' },
   { key: 'n_validated',      label: 'Validated' },
-  { key: 'n_true_positive',  label: 'True positive' },
-  { key: 'precision',        label: 'Precision' },
-  { key: 'pct_of_target',    label: '% of target' }
+  { key: 'pct_of_target',    label: '% of target' },
+  { key: 'cutoff',           label: 'Fitted cutoff' },
+  { key: 'n_retained',       label: 'Positives retained' }
 ];
 
 let sortKey = 'n_detections';
@@ -34,11 +41,19 @@ export function validationRows(birdnet) {
       latin: s.latin_name,
       klass: s.class,
       n_detections: num(s.n_detections),
+      pool_size: num(s.pool_size),
       validation_target: num(s.validation_target),
       n_validated: num(s.n_validated),
       n_true_positive: num(s.n_true_positive),
-      precision: s.precision === null || s.precision === undefined ? null : Number(s.precision),
-      pct_of_target: num(s.pct_of_target)
+      pct_of_target: num(s.pct_of_target),
+      cutoff: (s.cutoff === null || s.cutoff === undefined) ? null : Number(s.cutoff),
+      n_retained: (s.n_retained_positives === null || s.n_retained_positives === undefined)
+        ? null : Number(s.n_retained_positives),
+      pct_retained: (s.pct_retained === null || s.pct_retained === undefined)
+        ? null : Number(s.pct_retained),
+      // Why a cutoff is absent, when the fit ran but could not identify one.
+      fit_reason: (s.fit && s.fit.reason) ? String(s.fit.reason) : null,
+      strata: Array.isArray(s.strata) ? s.strata : []
     }));
 }
 
@@ -100,10 +115,30 @@ function renderBody(rows) {
     tr.appendChild(el('td', null, fmtInt(r.n_detections)));
     tr.appendChild(el('td', null, fmtInt(r.validation_target)));
     tr.appendChild(el('td', r.n_validated ? null : 'nil', fmtInt(r.n_validated)));
-    tr.appendChild(el('td', r.n_true_positive ? null : 'nil', fmtInt(r.n_true_positive)));
-    tr.appendChild(el('td', r.precision === null ? 'nil' : null,
-      r.precision === null ? 'not yet validated' : fmtNum(r.precision, 3)));
     tr.appendChild(el('td', r.pct_of_target ? null : 'nil', fmtPct(r.pct_of_target)));
+
+    // A cutoff exists only once the fit identifies one. Until then say which
+    // state we are in -- not started, or fitted-but-unidentifiable and why.
+    if (r.cutoff !== null) {
+      tr.appendChild(el('td', null, fmtNum(r.cutoff, 3)));
+    } else if (r.fit_reason) {
+      const td = el('td', 'nil', 'not identifiable');
+      td.title = r.fit_reason;
+      tr.appendChild(td);
+    } else {
+      tr.appendChild(el('td', 'nil', r.n_validated ? 'not yet fitted' : 'not started'));
+    }
+
+    if (r.n_retained !== null) {
+      const td = el('td', null, fmtInt(r.n_retained));
+      if (r.pct_retained !== null) {
+        td.appendChild(document.createTextNode(' '));
+        td.appendChild(el('span', 'latin', `(${fmtPct(r.pct_retained)})`));
+      }
+      tr.appendChild(td);
+    } else {
+      tr.appendChild(el('td', 'nil', '\u2014'));
+    }
     body.appendChild(tr);
   }
 }
@@ -157,9 +192,18 @@ export function renderValidation(ctx) {
 
   const sub = $('#validation-sub');
   if (sub) {
+    const nPer = Number(v.n_per_species);
+    const tp = Number(v.target_p);
     sub.textContent =
-      `Manual verification of BirdNET detections. Every count in the species chart is unvalidated ` +
-      `until this table fills in.`;
+      (Number.isFinite(nPer)
+        ? `${fmtInt(nPer)} detections are validated per species, spread across confidence strata. `
+        : 'Manual verification of BirdNET detections. ') +
+      (Number.isFinite(tp)
+        ? `A logistic regression of true-positive outcome on BirdNET confidence gives the cutoff ` +
+          `where P(true positive) reaches ${fmtNum(tp, 2)}; detections at or above it become the ` +
+          `positives for the occupancy model. `
+        : '') +
+      `Every count in the species chart is unvalidated until this table fills in.`;
   }
 
   // progress bar
@@ -184,29 +228,53 @@ export function renderValidation(ctx) {
   }
   overall.appendChild(wrap);
 
+  const nSp = Number(v.n_species_target);
+  const nFit = Number(v.n_species_fitted);
+
   overall.appendChild(stat('Detection pool', fmtInt(v.pool_size),
     v.pool_threshold !== undefined ? `at confidence \u2265 ${v.pool_threshold}` : null));
   overall.appendChild(stat('Validation target', fmtInt(v.n_target),
-    Number.isFinite(Number(v.target_fraction))
-      ? `${fmtNum(Number(v.target_fraction) * 100, 0)}% of the pool` : null));
+    (Number.isFinite(Number(v.n_per_species)) && Number.isFinite(nSp))
+      ? `${fmtInt(v.n_per_species)} per species \u00d7 ${fmtInt(nSp)} species` : null));
   overall.appendChild(stat('Validated', fmtInt(v.n_validated),
     notStarted ? 'none reviewed' : null));
-  overall.appendChild(stat('Overall precision',
-    v.overall_precision === null || v.overall_precision === undefined
-      ? 'not yet estimable' : fmtNum(Number(v.overall_precision), 3),
-    v.overall_precision === null || v.overall_precision === undefined
-      ? 'needs validated detections' : null));
+
+  // Cutoffs fitted, not a pooled precision: the sample is stratified, so a
+  // pooled ratio would not be the dataset's precision.
+  overall.appendChild(stat('Cutoffs fitted',
+    Number.isFinite(nFit) && Number.isFinite(nSp)
+      ? `${fmtInt(nFit)} of ${fmtInt(nSp)}` : '\u2014',
+    Number.isFinite(nFit) && nFit > 0
+      ? `median ${fmtNum(Number(v.cutoff_median), 3)} ` +
+        `(range ${fmtNum(Number(v.cutoff_min), 3)}\u2013${fmtNum(Number(v.cutoff_max), 3)})`
+      : 'needs validated detections in \u2265 2 strata'));
+
+  if (Number.isFinite(Number(v.n_retained_positives)) && v.n_retained_positives !== null) {
+    overall.appendChild(stat('Positives retained', fmtInt(v.n_retained_positives),
+      'at or above the fitted cutoffs, for the occupancy model'));
+  }
 
   const note = $('#validation-note');
-  if (note) note.textContent = v.note || '';
+  if (note) {
+    clear(note);
+    if (v.note) note.appendChild(el('span', null, v.note));
+    // The stratification caveat is a correctness point, not a footnote: it is
+    // why no "overall precision" figure is shown anywhere on this panel.
+    if (v.sampling_note) {
+      note.appendChild(el('p', 'panel-note', v.sampling_note));
+    }
+  }
 
   const rows = validationRows(birdnet);
   const caption = $('#validation-caption');
   if (caption) {
     caption.textContent =
       `${fmtInt(rows.length)} wildlife species with a validation target. ` +
-      `Click any column heading to sort. Precision is true positives divided by validated ` +
-      `detections and stays blank until a species has reviewed detections.`;
+      `Click any column heading to sort. "Fitted cutoff" is the confidence at which the ` +
+      `logistic fit reaches P(true positive) = ` +
+      `${Number.isFinite(Number(v.target_p)) ? fmtNum(Number(v.target_p), 2) : '0.95'}; ` +
+      `"positives retained" is how many detections sit at or above it. Both stay empty until ` +
+      `a species has validations in at least two confidence strata.`;
   }
   renderHead();
   renderBody(rows);

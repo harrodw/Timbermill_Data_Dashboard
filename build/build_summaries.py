@@ -65,8 +65,28 @@ JITTER_MAX_M = 110.0
 # quickly the detection pool shrinks as the threshold tightens.
 BIRDNET_THRESHOLDS = [0.25, 0.50, 0.75, 0.90]
 
-# Fraction of classifications to validate per species (prospectus Ch. 1).
-VALIDATION_TARGET_FRAC = 0.10
+# ---- Validation design ---------------------------------------------------
+# 150 recordings are validated per species, drawn STRATIFIED across confidence
+# bins, and a logistic regression of true-positive outcome on BirdNET
+# confidence gives the threshold at which P(true positive) = 0.95. Detections
+# at or above that fitted cutoff are the positives carried into the
+# multi-species occupancy model.
+#
+# Stratifying matters here: raw confidences are heavily skewed toward the 0.25
+# floor (median 0.43), so a simple random 150 would place almost no
+# validations near the crossing point and the cutoff would be extrapolated
+# rather than estimated. Equal allocation per bin puts data on both sides of
+# it. The consequence is that validated detections are NOT a random sample of
+# all detections, so the pooled validated precision is not the dataset
+# precision -- the fitted curve is the object of interest, and per-bin
+# precision is reported instead of a pooled average.
+VALIDATION_N_PER_SPECIES = 150
+VALIDATION_TARGET_P = 0.95
+
+# Bin edges over the retained confidence range. Eight bins at 150 per species
+# is ~19 validations per bin.
+VALIDATION_BIN_EDGES = [0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 1.001]
+
 # Detections at or above this confidence make up the pool eligible for
 # validation, matching the liberal BirdNET threshold in the prospectus.
 VALIDATION_POOL_THRESHOLD = 0.25
@@ -200,6 +220,98 @@ def count_lines(path: Path) -> int:
     except Exception:
         with path.open("rb") as fh:
             return max(sum(1 for _ in fh) - 1, 0)
+
+
+def bin_index(conf: float) -> int:
+    """Confidence -> validation stratum index, or -1 below the pool floor."""
+    for i in range(len(VALIDATION_BIN_EDGES) - 1):
+        if VALIDATION_BIN_EDGES[i] <= conf < VALIDATION_BIN_EDGES[i + 1]:
+            return i
+    return -1
+
+
+def bin_label(i: int) -> str:
+    lo = VALIDATION_BIN_EDGES[i]
+    hi = VALIDATION_BIN_EDGES[i + 1]
+    hi = min(hi, 1.0)
+    return f"{lo:.2f}-{hi:.2f}"
+
+
+def fit_logistic_cutoff(rows):
+    """Fit P(true positive) ~ confidence and solve for VALIDATION_TARGET_P.
+
+    ``rows`` is a list of (confidence, n_checked, n_true_positive) at the bin
+    level; the fit is on grouped binomial data, which is what a per-bin
+    validation tally gives you. Newton-Raphson on the two-parameter logit --
+    small, dependency-free, and the design matrix is Nx2, so this converges in
+    a handful of iterations.
+
+    Returns None when the data cannot identify a cutoff: fewer than two bins
+    with validations, no variation in outcome, a non-increasing fit, or a
+    crossing point outside the confidence range. Reporting "not yet
+    identifiable" is correct in those cases -- a number extrapolated from one
+    bin would look like a result without being one.
+    """
+    pts = [(float(c), int(n), int(k)) for c, n, k in rows if int(n) > 0]
+    if len({c for c, _, _ in pts}) < 2:
+        return None
+    total_n = sum(n for _, n, _ in pts)
+    total_k = sum(k for _, _, k in pts)
+    if total_k == 0 or total_k == total_n:
+        return None  # no variation: the fit is degenerate
+
+    b0, b1 = 0.0, 0.0
+    for _ in range(200):
+        # Score vector and Fisher information for the logit likelihood.
+        g0 = g1 = h00 = h01 = h11 = 0.0
+        for c, n, k in pts:
+            eta = b0 + b1 * c
+            eta = max(min(eta, 30.0), -30.0)
+            p = 1.0 / (1.0 + math.exp(-eta))
+            w = n * p * (1.0 - p)
+            r = k - n * p
+            g0 += r
+            g1 += r * c
+            h00 += w
+            h01 += w * c
+            h11 += w * c * c
+        det = h00 * h11 - h01 * h01
+        if abs(det) < 1e-12:
+            return None
+        d0 = (h11 * g0 - h01 * g1) / det
+        d1 = (h00 * g1 - h01 * g0) / det
+        b0 += d0
+        b1 += d1
+        if max(abs(d0), abs(d1)) < 1e-9:
+            break
+    else:
+        return None
+
+    if b1 <= 0:
+        # Precision not increasing with confidence -- the premise of a
+        # threshold does not hold for this species yet.
+        return {"slope": round(b1, 4), "intercept": round(b0, 4),
+                "cutoff": None,
+                "reason": "fitted precision does not increase with confidence"}
+
+    logit_t = math.log(VALIDATION_TARGET_P / (1.0 - VALIDATION_TARGET_P))
+    cutoff = (logit_t - b0) / b1
+    out = {"slope": round(b1, 4), "intercept": round(b0, 4),
+           "n_validated": total_n, "n_true_positive": total_k,
+           "n_bins": len(pts)}
+    if cutoff > 1.0:
+        out["cutoff"] = None
+        out["reason"] = (f"P={VALIDATION_TARGET_P:.2f} is not reached within "
+                         f"the confidence range (extrapolates to "
+                         f"{cutoff:.2f})")
+    elif cutoff < VALIDATION_POOL_THRESHOLD:
+        # Already above target everywhere retained; the floor is the cutoff.
+        out["cutoff"] = round(VALIDATION_POOL_THRESHOLD, 3)
+        out["reason"] = (f"fit reaches P={VALIDATION_TARGET_P:.2f} below the "
+                         f"retained floor; floor applies")
+    else:
+        out["cutoff"] = round(cutoff, 3)
+    return out
 
 
 def write_json(name: str, payload) -> None:
@@ -475,6 +587,9 @@ def build_birdnet() -> dict:
 
     sp_tot = Counter()
     sp_thresh = {t: Counter() for t in BIRDNET_THRESHOLDS}
+    # species -> stratum index -> n detections, for the validation design and
+    # for counting how many positives a fitted cutoff would retain.
+    sp_bins = defaultdict(Counter)
     sp_meta = {}
     sp_plots = defaultdict(set)
     sp_plot_type = defaultdict(Counter)
@@ -497,6 +612,16 @@ def build_birdnet() -> dict:
             sub = chunk.loc[conf >= t, "Species"]
             for sp, n in sub.value_counts().items():
                 sp_thresh[t][sp] += int(n)
+
+        # Stratum tallies for the validation design.
+        strata = conf.map(bin_index)
+        keep = strata >= 0
+        if keep.any():
+            grouped = (chunk.loc[keep, "Species"]
+                       .groupby([chunk.loc[keep, "Species"],
+                                 strata.loc[keep]]).size())
+            for (sp, b), n in grouped.items():
+                sp_bins[sp][int(b)] += int(n)
 
         for sp, g in chunk.groupby("Species"):
             if sp not in sp_meta:
@@ -522,19 +647,24 @@ def build_birdnet() -> dict:
                 hour_hist[str(klass)][int(h)] += int(n)
 
     # ---- validation log ----------------------------------------------------
-    val = {}
+    # species -> confidence bin label -> {n_checked, n_true_positive}
+    val = defaultdict(dict)
     if VALIDATION_LOG.exists():
         with VALIDATION_LOG.open() as fh:
             for row in csv.DictReader(fh):
                 name = (row.get("species") or "").strip()
-                if not name:
+                cbin = (row.get("confidence_bin") or "").strip()
+                if not name or not cbin:
                     continue
                 try:
                     nc = int(float(row.get("n_checked") or 0))
                     ntp = int(float(row.get("n_true_positive") or 0))
                 except ValueError:
                     continue
-                val[name] = {"n_checked": nc, "n_true_positive": ntp}
+                if ntp > nc:
+                    log(f"WARNING: {name} [{cbin}] has more true positives "
+                        f"({ntp}) than checked ({nc}); check the log")
+                val[name][cbin] = {"n_checked": nc, "n_true_positive": ntp}
 
     # Plot-type label mapping: bird/frog ARUs at turbine plots are recorded
     # under the "TO" code (they sit at the opening edge, sampling both the
@@ -543,12 +673,67 @@ def build_birdnet() -> dict:
         return {"TO": "Turbine Opening", "IF": "Interior Forest",
                 "RE": "Reference Edge", "TE": "Turbine Edge"}.get(code, code)
 
+    n_bins = len(VALIDATION_BIN_EDGES) - 1
     species = []
     for sp, total in sp_tot.most_common():
         meta = sp_meta.get(sp, {})
         pool = sp_thresh[VALIDATION_POOL_THRESHOLD][sp]
-        v = val.get(sp)
-        target = int(math.ceil(pool * VALIDATION_TARGET_FRAC))
+        bins = sp_bins.get(sp, Counter())
+        v = val.get(sp, {})
+
+        # Stratified allocation: spread VALIDATION_N_PER_SPECIES evenly over
+        # the strata that actually contain detections, so no effort is
+        # allocated to an empty confidence band. Remainders go to the
+        # highest-confidence occupied strata, where the cutoff usually sits.
+        occupied = [b for b in range(n_bins) if bins.get(b, 0) > 0]
+        alloc = {}
+        if occupied:
+            base, extra = divmod(min(VALIDATION_N_PER_SPECIES, pool),
+                                 len(occupied))
+            for b in occupied:
+                alloc[b] = min(base, bins[b])
+            for b in sorted(occupied, reverse=True)[:extra]:
+                if alloc[b] < bins[b]:
+                    alloc[b] += 1
+            # Redistribute any shortfall from strata too small to fill.
+            short = min(VALIDATION_N_PER_SPECIES, pool) - sum(alloc.values())
+            for b in sorted(occupied, key=lambda x: -bins[x]):
+                while short > 0 and alloc[b] < bins[b]:
+                    alloc[b] += 1
+                    short -= 1
+                if short <= 0:
+                    break
+
+        strata = []
+        fit_rows = []
+        done = tp = 0
+        for b in range(n_bins):
+            n_avail = int(bins.get(b, 0))
+            if n_avail == 0:
+                continue
+            key = bin_label(b)
+            rec = v.get(key, {})
+            nc = int(rec.get("n_checked", 0))
+            ntp = int(rec.get("n_true_positive", 0))
+            done += nc
+            tp += ntp
+            mid = (VALIDATION_BIN_EDGES[b] +
+                   min(VALIDATION_BIN_EDGES[b + 1], 1.0)) / 2.0
+            if nc > 0:
+                fit_rows.append((mid, nc, ntp))
+            strata.append({
+                "bin": key,
+                "midpoint": round(mid, 3),
+                "n_available": n_avail,
+                "target": int(alloc.get(b, 0)),
+                "n_checked": nc,
+                "n_true_positive": ntp,
+                "precision": round(ntp / nc, 3) if nc else None,
+            })
+
+        fit = fit_logistic_cutoff(fit_rows)
+        target_total = sum(alloc.values())
+
         entry = {
             "species": str(sp),
             "latin_name": meta.get("latin_name"),
@@ -560,17 +745,39 @@ def build_birdnet() -> dict:
             "n_plots": len(sp_plots[sp]),
             "by_plot_type": {expand_pt(k): int(v2)
                              for k, v2 in sp_plot_type[sp].items()},
-            "validation_target": target,
-            "n_validated": v["n_checked"] if v else 0,
-            "n_true_positive": v["n_true_positive"] if v else 0,
+            "pool_size": int(pool),
+            "validation_target": int(target_total),
+            "n_validated": done,
+            "n_true_positive": tp,
+            "pct_of_target": (round(100 * done / target_total, 1)
+                              if target_total else 0.0),
+            "strata": strata,
+            "fit": fit,
         }
-        if v and v["n_checked"] > 0:
-            entry["precision"] = round(v["n_true_positive"] / v["n_checked"], 3)
-            entry["pct_of_target"] = (round(100 * v["n_checked"] / target, 1)
-                                      if target else None)
+        # Per-bin precision is what the fit consumes; a pooled ratio over a
+        # stratified sample is not this species' precision, so it is labelled
+        # as sample-only rather than presented as a precision estimate.
+        entry["sample_true_positive_rate"] = (round(tp / done, 3)
+                                              if done else None)
+
+        cutoff = (fit or {}).get("cutoff")
+        if cutoff is not None:
+            retained = sum(n for b, n in bins.items()
+                           if VALIDATION_BIN_EDGES[b] >= cutoff)
+            # Partial stratum containing the cutoff: attribute pro rata.
+            for b, n in bins.items():
+                lo, hi = VALIDATION_BIN_EDGES[b], min(
+                    VALIDATION_BIN_EDGES[b + 1], 1.0)
+                if lo < cutoff < hi and hi > lo:
+                    retained += int(round(n * (hi - cutoff) / (hi - lo)))
+            entry["cutoff"] = cutoff
+            entry["n_retained_positives"] = int(retained)
+            entry["pct_retained"] = (round(100 * retained / pool, 1)
+                                     if pool else None)
         else:
-            entry["precision"] = None
-            entry["pct_of_target"] = 0.0
+            entry["cutoff"] = None
+            entry["n_retained_positives"] = None
+            entry["pct_retained"] = None
         species.append(entry)
 
     wildlife = [s for s in species
@@ -585,11 +792,14 @@ def build_birdnet() -> dict:
         for p in sorted(plot_dates)
     ]
 
-    total_pool = sum(s["n_by_threshold"][str(VALIDATION_POOL_THRESHOLD)]
-                     for s in wildlife)
+    total_pool = sum(s["pool_size"] for s in wildlife)
     total_target = sum(s["validation_target"] for s in wildlife)
     total_done = sum(s["n_validated"] for s in wildlife)
     total_tp = sum(s["n_true_positive"] for s in wildlife)
+    n_fitted = sum(1 for s in wildlife if s.get("cutoff") is not None)
+    cutoffs = sorted(s["cutoff"] for s in wildlife if s.get("cutoff") is not None)
+    retained = sum(s["n_retained_positives"] for s in wildlife
+                   if s.get("n_retained_positives") is not None)
 
     return {
         "note": (
@@ -627,21 +837,44 @@ def build_birdnet() -> dict:
                    for k, v in hour_hist.items()
                    if k in ("Aves", "Amphibia")},
         "validation": {
-            "target_fraction": VALIDATION_TARGET_FRAC,
+            "design": "stratified_logistic",
+            "n_per_species": VALIDATION_N_PER_SPECIES,
+            "target_p": VALIDATION_TARGET_P,
+            "bin_edges": VALIDATION_BIN_EDGES,
             "pool_threshold": VALIDATION_POOL_THRESHOLD,
             "pool_size": int(total_pool),
             "n_target": int(total_target),
             "n_validated": int(total_done),
             "pct_complete": (round(100 * total_done / total_target, 2)
                              if total_target else 0.0),
-            "overall_precision": (round(total_tp / total_done, 3)
-                                  if total_done else None),
+            "n_species_target": len(wildlife),
+            "n_species_fitted": n_fitted,
+            "cutoff_median": (cutoffs[len(cutoffs) // 2] if cutoffs else None),
+            "cutoff_min": (cutoffs[0] if cutoffs else None),
+            "cutoff_max": (cutoffs[-1] if cutoffs else None),
+            "n_retained_positives": int(retained) if n_fitted else None,
+            "sample_true_positive_rate": (round(total_tp / total_done, 3)
+                                          if total_done else None),
             "log_present": VALIDATION_LOG.exists(),
             "note": (
-                "Validation target is 10% of detections at or above the "
-                "0.25 confidence threshold, per the false-positive model "
-                "(Doser et al. 2021, model AV). Update "
-                "build/validation_log.csv and rebuild to refresh progress."
+                f"{VALIDATION_N_PER_SPECIES} detections are validated per "
+                f"species, allocated across "
+                f"{len(VALIDATION_BIN_EDGES) - 1} confidence strata. A "
+                f"logistic regression of true-positive outcome on BirdNET "
+                f"confidence gives the cutoff at which "
+                f"P(true positive) = {VALIDATION_TARGET_P:.2f}; detections at "
+                f"or above it are the positives carried into the "
+                f"multi-species occupancy model. Update "
+                f"build/validation_log.csv and rebuild to refresh progress."
+            ),
+            "sampling_note": (
+                "Validations are stratified by confidence, not drawn at "
+                "random, because raw confidences are concentrated near the "
+                "0.25 floor and a random sample would leave the region around "
+                "the cutoff almost unobserved. Stratification means the "
+                "pooled true-positive rate over validated clips is a property "
+                "of the sample, not the precision of the dataset -- read the "
+                "fitted curve and the per-stratum rates instead."
             ),
         },
         "species": species,
@@ -652,39 +885,48 @@ def build_birdnet() -> dict:
 # 5. Validation log template
 # --------------------------------------------------------------------------
 def ensure_validation_log(birdnet: dict) -> None:
-    """Create or extend the validation log so every species has a row."""
+    """Create or extend the validation log: one row per species per stratum.
+
+    Counts you have already entered are preserved, keyed on
+    (species, confidence_bin), so rebuilding after new BirdNET output never
+    discards validation work.
+    """
+    header = ["species", "latin_name", "class", "confidence_bin",
+              "n_available", "target", "n_checked", "n_true_positive", "notes"]
     existing = {}
-    header = ["species", "latin_name", "class", "n_detections_conf25",
-              "validation_target", "n_checked", "n_true_positive", "notes"]
     if VALIDATION_LOG.exists():
         with VALIDATION_LOG.open() as fh:
             for row in csv.DictReader(fh):
-                if (row.get("species") or "").strip():
-                    existing[row["species"].strip()] = row
+                name = (row.get("species") or "").strip()
+                cbin = (row.get("confidence_bin") or "").strip()
+                if name and cbin:
+                    existing[(name, cbin)] = row
 
     rows = []
     for s in birdnet["species"]:
         if s["class"] not in ("Aves", "Amphibia", "Mammalia"):
             continue
-        prev = existing.get(s["species"], {})
-        rows.append({
-            "species": s["species"],
-            "latin_name": s["latin_name"] or "",
-            "class": s["class"] or "",
-            "n_detections_conf25": s["n_by_threshold"][
-                str(VALIDATION_POOL_THRESHOLD)],
-            "validation_target": s["validation_target"],
-            "n_checked": prev.get("n_checked", "0"),
-            "n_true_positive": prev.get("n_true_positive", "0"),
-            "notes": prev.get("notes", ""),
-        })
+        for st in s["strata"]:
+            prev = existing.get((s["species"], st["bin"]), {})
+            rows.append({
+                "species": s["species"],
+                "latin_name": s["latin_name"] or "",
+                "class": s["class"] or "",
+                "confidence_bin": st["bin"],
+                "n_available": st["n_available"],
+                "target": st["target"],
+                "n_checked": prev.get("n_checked", "0"),
+                "n_true_positive": prev.get("n_true_positive", "0"),
+                "notes": prev.get("notes", ""),
+            })
 
     VALIDATION_LOG.parent.mkdir(parents=True, exist_ok=True)
     with VALIDATION_LOG.open("w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=header)
         w.writeheader()
         w.writerows(rows)
-    log(f"validation log: {len(rows)} species rows -> "
+    n_sp = len({r["species"] for r in rows})
+    log(f"validation log: {len(rows)} stratum rows across {n_sp} species -> "
         f"{VALIDATION_LOG.relative_to(ROOT)}")
 
 

@@ -3,7 +3,9 @@
 Outputs land in docs/media/spectrograms/. Raw audio is read from raw_data/
 and never copied into docs/.
 """
+import json
 import os
+import subprocess
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -21,26 +23,73 @@ PLOT_TYPE_COLOR = {
     "Reference Edge": "#6B8EAD",
 }
 
-# Recording-level context, matched on recorder+timestamp against the
-# File column of preliminary_BirdNET_Results.csv. The clip-level species
-# is NOT resolvable from that table (see report), so no species is named.
-CLIPS = {
-    "SMM2-02_20260311_070102_001_C80.wav": dict(
-        clip_id="TO02_20260311_0701",
-        plot="TO02", plot_type="Turbine Opening",
-        recorder="SMM2-02", recorded_local="2026-03-11 07:01:02",
-    ),
-    "SMM2-23_20260418_060802_001_C32.wav": dict(
-        clip_id="RE07_20260418_0608_a",
-        plot="RE07", plot_type="Reference Edge",
-        recorder="SMM2-23", recorded_local="2026-04-18 06:08:02",
-    ),
-    "SMM2-23_20260418_060802_001_C57.wav": dict(
-        clip_id="RE07_20260418_0608_b",
-        plot="RE07", plot_type="Reference Edge",
-        recorder="SMM2-23", recorded_local="2026-04-18 06:08:02",
-    ),
+# Class accent for the title, used when a clip is a single named species
+# rather than a whole-recording excerpt tied to one plot.
+CLASS_COLOR = {"Aves": "#4F7942", "Amphibia": "#6B8EAD"}
+
+# The clips are named by species: the identification is the researcher's,
+# made by listening, and is the authority here. Latin names, taxonomic class
+# and all detection counts are looked up from the BirdNET summary so nothing
+# on the figure is typed from memory.
+#
+# These files carry no recorder, plot or timestamp -- unlike the earlier
+# SMM2-<unit>_<date>_<time> exports -- so no per-clip location or date is
+# claimed. Context shown is season-wide for the species.
+CLIP_SPECIES = {
+    "brimleys_chorus_frog": "Brimley's Chorus Frog",
+    "field_sparrow": "Field Sparrow",
+    "hooded_warbler": "Hooded Warbler",
+    "pickerel_frog": "Pickerel Frog",
+    "pine_warbler": "Pine Warbler",
 }
+
+BIRDNET_JSON = os.path.join(REPO, "docs", "data", "birdnet.json")
+
+
+def clip_stem(fname):
+    """Filename -> clip id, tolerating a present or absent .wav suffix."""
+    stem = fname[:-4] if fname.lower().endswith(".wav") else fname
+    return stem
+
+
+def load_species_index():
+    """Species name -> BirdNET summary row (latin name, class, counts)."""
+    with open(BIRDNET_JSON) as fh:
+        bn = json.load(fh)
+    return {s["species"]: s for s in bn["species"]}
+
+
+def discover_clips():
+    """Build the clip table from what is actually in raw_data/Audio_Data.
+
+    Every clip must resolve to a species present in the BirdNET results; an
+    unrecognized filename is reported rather than guessed at, so a typo
+    surfaces instead of silently producing an unlabelled figure.
+    """
+    index = load_species_index()
+    clips, problems = {}, []
+    for fname in sorted(os.listdir(AUDIO_IN)):
+        if fname.startswith("."):
+            continue
+        stem = clip_stem(fname)
+        species = CLIP_SPECIES.get(stem)
+        if species is None:
+            problems.append(f"{fname}: no species mapping for '{stem}'")
+            continue
+        row = index.get(species)
+        if row is None:
+            problems.append(f"{fname}: '{species}' absent from birdnet.json")
+            continue
+        clips[fname] = dict(
+            clip_id=stem,
+            species=species,
+            latin_name=row.get("latin_name"),
+            taxon_class=row.get("class"),
+            n_detections=row.get("n_detections"),
+            n_plots=row.get("n_plots"),
+            by_plot_type=row.get("by_plot_type") or {},
+        )
+    return clips, problems
 
 NPERSEG, NOVERLAP = 1024, 896
 DB_RANGE = 62.0   # dB below clip maximum
@@ -58,7 +107,7 @@ def render(fname, meta, outdir=SPEC_OUT):
     vmax = float(Sdb.max())
     vmin = vmax - DB_RANGE
 
-    accent = PLOT_TYPE_COLOR[meta["plot_type"]]
+    accent = CLASS_COLOR.get(meta["taxon_class"], "#444444")
 
     fig, ax = plt.subplots(figsize=(6.4, 3.4))
     mesh = ax.pcolormesh(t, f / 1000.0, Sdb, cmap="viridis",
@@ -75,18 +124,19 @@ def render(fname, meta, outdir=SPEC_OUT):
     cbar.set_label("Power (dB re clip max)")
     cbar.set_ticks(np.arange(np.ceil(vmin / 10) * 10, vmax + 1, 20))
 
-    # Plot identity carried in the dashboard's plot-type color (colour threading)
-    ax.set_title(f"{meta['plot']} \u00b7 {meta['plot_type']}", loc="left",
-                 color=accent)
-    ax.text(1.0, 1.02, f"{meta['recorded_local']} local",
-            transform=ax.transAxes, ha="right", va="bottom")
+    ax.set_title(meta["species"], loc="left", color=accent)
+    if meta.get("latin_name"):
+        ax.text(1.0, 1.02, meta["latin_name"], transform=ax.transAxes,
+                ha="right", va="bottom", style="italic")
 
     for s in ("top", "right"):
         ax.spines[s].set_visible(False)
     ax.tick_params(direction="out")
 
-    caption = (f"Songmeter Micro 2 ({meta['recorder']}), {dur:.0f} s excerpt, "
-               f"{sr/1000:g} kHz mono. Species not resolvable to this clip.")
+    caption = (f"Songmeter Micro 2, {dur:.0f} s excerpt, {sr/1000:g} kHz mono. "
+               f"Identified by ear; BirdNET logged "
+               f"{meta['n_detections']:,} unvalidated detections of this "
+               f"species at {meta['n_plots']} plots.")
     fig.text(0.105, 0.015, caption, ha="left", va="bottom",
              fontsize=mpl.rcParams["legend.fontsize"], color="#444444")
 
@@ -94,4 +144,79 @@ def render(fname, meta, outdir=SPEC_OUT):
 
     out = os.path.join(outdir, meta["clip_id"] + ".png")
     fig.savefig(out, dpi=DPI)
+    plt.close(fig)
     return fig, out, dict(dur=dur, sr=sr, vmin=vmin, vmax=vmax)
+
+
+# --------------------------------------------------------------------------
+# Audio transcode
+# --------------------------------------------------------------------------
+AUDIO_OUT = os.path.join(REPO, "docs", "media", "audio")
+
+
+def ffmpeg_bin():
+    """Locate ffmpeg: system install first, else the imageio-ffmpeg bundle."""
+    from shutil import which
+    exe = which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as err:
+        raise RuntimeError(
+            "No ffmpeg available. Install one of:\n"
+            "  pip install imageio-ffmpeg      (bundled binary)\n"
+            "  conda install -c conda-forge ffmpeg"
+        ) from err
+
+
+def transcode(fname, meta, outdir=AUDIO_OUT):
+    """WAV -> web-playable AAC, full audible band retained."""
+    os.makedirs(outdir, exist_ok=True)
+    src = os.path.join(AUDIO_IN, fname)
+    dst = os.path.join(outdir, meta["clip_id"] + ".m4a")
+    subprocess.run(
+        [ffmpeg_bin(), "-y", "-loglevel", "error", "-i", src,
+         "-c:a", "aac", "-b:a", "128k", "-ac", "1",
+         # Strip any container metadata rather than carrying it to the web.
+         "-map_metadata", "-1", dst],
+        check=True)
+    return dst
+
+
+def main():
+    os.makedirs(SPEC_OUT, exist_ok=True)
+    clips, problems = discover_clips()
+    for p in problems:
+        print(f"  SKIP {p}")
+    if not clips:
+        raise SystemExit("No clips resolved -- nothing written.")
+
+    stale_spec = {f for f in os.listdir(SPEC_OUT) if f.endswith(".png")}
+    stale_audio = (set(os.listdir(AUDIO_OUT)) if os.path.isdir(AUDIO_OUT)
+                   else set())
+
+    for fname, meta in clips.items():
+        _, png, info = render(fname, meta)
+        m4a = transcode(fname, meta)
+        stale_spec.discard(os.path.basename(png))
+        stale_audio.discard(os.path.basename(m4a))
+        print(f"  {meta['species']:24s} {info['dur']:.0f}s "
+              f"{info['sr']/1000:g}kHz -> {os.path.basename(png)}, "
+              f"{os.path.basename(m4a)}")
+
+    # Media for clips that no longer exist would otherwise linger in docs/
+    # and keep being published after the source was replaced.
+    for leftover in sorted(stale_spec):
+        os.remove(os.path.join(SPEC_OUT, leftover))
+        print(f"  removed stale spectrogram {leftover}")
+    for leftover in sorted(stale_audio):
+        os.remove(os.path.join(AUDIO_OUT, leftover))
+        print(f"  removed stale audio {leftover}")
+
+    print(f"\n{len(clips)} clips rendered and transcoded.")
+
+
+if __name__ == "__main__":
+    main()

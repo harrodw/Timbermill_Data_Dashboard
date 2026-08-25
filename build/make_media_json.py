@@ -73,46 +73,74 @@ PHOTOS = {
 }
 
 # --- audio -------------------------------------------------------------
-# The clip filenames (…_001_C<NN>.wav) do not appear anywhere in
-# preliminary_BirdNET_Results.csv — that table's File column names the
-# full ~60-minute parent recording. No tested reading of the C<NN> suffix
-# picks out a single detection, so NO species is attributed to a clip.
-# `detections` is therefore empty by design, and `recording_context`
-# carries what IS verifiable: the parent recording's detection totals.
-AUDIO = [
-    dict(id="TO02_20260311_0701", plot="TO02", plot_type="Turbine Opening",
-         recorded_local="2026-03-11 07:01:02", recorder="SMM2-02",
-         parent_recording="SMM2-02_20260311_070102.wav",
-         caption="Dawn chorus at a turbine opening, 11 March, 07:01. A 5-second "
-                 "excerpt from an hour-long recording in which BirdNET flagged "
-                 "504 detections across 20 species. No species can be tied to "
-                 "this excerpt specifically."),
-    dict(id="RE07_20260418_0608_a", plot="RE07", plot_type="Reference Edge",
-         recorded_local="2026-04-18 06:08:02", recorder="SMM2-23",
-         parent_recording="SMM2-23_20260418_060802.wav",
-         caption="Dawn chorus at a forest/agriculture reference edge, 18 April, "
-                 "06:08. A 5-second excerpt from an hour-long recording in which "
-                 "BirdNET flagged 315 detections across 20 species. No species "
-                 "can be tied to this excerpt specifically."),
-    dict(id="RE07_20260418_0608_b", plot="RE07", plot_type="Reference Edge",
-         recorded_local="2026-04-18 06:08:02", recorder="SMM2-23",
-         parent_recording="SMM2-23_20260418_060802.wav",
-         caption="A second 5-second excerpt from the same reference-edge dawn "
-                 "recording on 18 April, 06:08. No species can be tied to this "
-                 "excerpt specifically."),
-]
+# Each clip is named for the species it contains; that identification is the
+# researcher's, made by listening, and is authoritative here. Latin name,
+# taxonomic class and every detection count are read from birdnet.json, so
+# nothing on the panel is typed from memory.
+#
+# These files carry no recorder, plot or timestamp (unlike the earlier
+# SMM2-<unit>_<date>_<time> exports), so no per-clip location or date is
+# claimed. The context shown is season-wide for the species.
+AUDIO_CAPTIONS = {
+    "brimleys_chorus_frog":
+        "The short rasping call of Brimley's chorus frog, one of the first "
+        "species calling in the emergent wetlands that formed under the "
+        "turbines in early spring.",
+    "field_sparrow":
+        "The accelerating trill of a field sparrow, a shrubland species "
+        "expected to benefit from the herbaceous openings around turbines.",
+    "hooded_warbler":
+        "The ringing song of a hooded warbler, an interior-forest species of "
+        "the shaded understory beneath closed canopy.",
+    "pickerel_frog":
+        "The low snore of a pickerel frog, the most frequently detected "
+        "amphibian of the season.",
+    "pine_warbler":
+        "The musical trill of a pine warbler, the second most frequently "
+        "detected species in the acoustic dataset after eastern towhee.",
+}
 
 AUDIO_NOTE = (
     "Spectrograms show a 5-second excerpt at 24 kHz mono (0-12 kHz displayed, "
-    "the full recorded band). Species are not attributed to individual clips: "
-    "the excerpt filenames do not appear in the BirdNET results, whose File "
-    "column refers to the full hour-long parent recording. `recording_context` "
-    "reports unvalidated BirdNET detections for that parent recording, not for "
-    "the excerpt."
+    "the full recorded band). The species on each clip was identified by ear "
+    "by the researcher. Detection counts beside it are season-wide, "
+    "unvalidated BirdNET totals for that species across the whole dataset -- "
+    "they describe how often the classifier flagged the species, not this "
+    "clip. These files carry no recorder or timestamp, so no plot or date is "
+    "attributed to an individual clip."
 )
 
 
-def build(rec_ctx):
+def load_species_rows():
+    """clip_id -> BirdNET summary row, for the clips actually present.
+
+    The species mapping lives in make_spectrograms.py so the figure and the
+    manifest can never disagree about which clip is which species.
+    """
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import make_spectrograms as ms
+    clips, problems = ms.discover_clips()
+    rows = {}
+    for meta in clips.values():
+        rows[meta["clip_id"]] = dict(
+            species=meta["species"],
+            latin_name=meta["latin_name"],
+            **{"class": meta["taxon_class"]},
+            n_detections=meta["n_detections"],
+            n_plots=meta["n_plots"],
+            by_plot_type=meta["by_plot_type"],
+        )
+    # Validation targets come straight from the published summary.
+    with open(os.path.join(REPO, "docs", "data", "birdnet.json")) as fh:
+        targets = {s["species"]: s.get("validation_target")
+                   for s in json.load(fh)["species"]}
+    for r in rows.values():
+        r["validation_target"] = targets.get(r["species"])
+    return rows, problems
+
+
+def build(species_rows):
     views = {}
 
     for view_id, items in PHOTOS.items():
@@ -132,28 +160,30 @@ def build(rec_ctx):
         views[view_id] = dict(kind="photo", items=out)
 
     audio_items = []
-    for it in AUDIO:
-        ctx = rec_ctx[it["parent_recording"]]
+    for clip_id, row in sorted(species_rows.items()):
+        by_pt = row.get("by_plot_type") or {}
+        top_pt = max(by_pt.items(), key=lambda kv: kv[1])[0] if by_pt else None
         audio_items.append(dict(
-            id=it["id"],
-            spectrogram=f"media/spectrograms/{it['id']}.png",
-            audio=f"media/audio/{it['id']}.m4a",
-            caption=it["caption"],
-            plot=it["plot"],
-            plot_type=it["plot_type"],
-            recorded_local=it["recorded_local"],
-            detections=[],
+            id=clip_id,
+            spectrogram=f"media/spectrograms/{clip_id}.png",
+            audio=f"media/audio/{clip_id}.m4a",
+            caption=AUDIO_CAPTIONS.get(clip_id, ""),
+            common_name=row["species"],
+            latin_name=row.get("latin_name"),
+            taxon_class=row.get("class"),
             sensor_type="ARU",
             credit=CREDIT,
             duration_sec=5.0,
             sample_rate_hz=24000,
-            recording_context=dict(
-                parent_recording=it["parent_recording"],
-                n_detections=ctx["n_detections"],
-                n_species=ctx["n_species"],
-                top_species=ctx["top"],
-                note="Unvalidated BirdNET detections for the full parent "
-                     "recording, not for this excerpt.",
+            # Season-wide, explicitly not clip-level.
+            species_context=dict(
+                n_detections=row.get("n_detections"),
+                n_plots=row.get("n_plots"),
+                by_plot_type=by_pt,
+                most_detected_plot_type=top_pt,
+                validation_target=row.get("validation_target"),
+                note="Unvalidated BirdNET detections for this species across "
+                     "the whole 2026 season, not for this clip.",
             ),
         ))
     views["bird_frog_audio"] = dict(kind="audio", note=AUDIO_NOTE,
@@ -163,3 +193,38 @@ def build(rec_ctx):
         credit=CREDIT,
         views=views,
     )
+
+
+def main():
+    rows, problems = load_species_rows()
+    for p in problems:
+        print(f"  SKIP {p}")
+    if not rows:
+        raise SystemExit("No audio clips resolved -- media.json not written.")
+
+    payload = build(rows)
+    out = os.path.join(REPO, "docs", "data", "media.json")
+    with open(out, "w") as fh:
+        json.dump(payload, fh, separators=(",", ":"), allow_nan=False)
+
+    # Every referenced asset must exist, or the gallery renders broken tiles.
+    docs = os.path.join(REPO, "docs")
+    missing = []
+    for view in payload["views"].values():
+        for item in view["items"]:
+            for key in ("thumb", "display", "spectrogram", "audio"):
+                rel = item.get(key)
+                if rel and not os.path.exists(os.path.join(docs, rel)):
+                    missing.append(rel)
+    if missing:
+        raise SystemExit("Referenced media missing:\n  " +
+                         "\n  ".join(missing))
+
+    counts = ", ".join(f"{k} {len(v['items'])}"
+                       for k, v in payload["views"].items())
+    print(f"  wrote docs/data/media.json ({counts}); "
+          f"all referenced assets present")
+
+
+if __name__ == "__main__":
+    main()

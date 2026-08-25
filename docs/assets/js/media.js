@@ -8,7 +8,7 @@
    "not yet published" state, never an error.
    ========================================================================== */
 
-import { $, el, clear, fmtInt, fmtNum, plotColor, showPanelError, hidePanelError } from './data.js';
+import { $, el, clear, fmtInt, fmtNum, plotColor, orderPlotTypes, showPanelError, hidePanelError } from './data.js';
 
 let lightboxBound = false;
 
@@ -143,7 +143,11 @@ function renderAudio(items, body) {
 
     const meta = el('div', 'audio-meta');
     const head = el('div', 'audio-head');
-    head.appendChild(el('span', 'audio-plot', item.plot ? `Plot ${item.plot}` : (item.id || 'Recording')));
+    // Species-named clips lead with the species; clips that instead carry a
+    // plot and timestamp (the earlier export naming) lead with the plot.
+    head.appendChild(el('span', 'audio-plot',
+      item.common_name || (item.plot ? `Plot ${item.plot}` : (item.id || 'Recording'))));
+    if (item.latin_name) head.appendChild(el('span', 'audio-latin', item.latin_name));
     if (item.plot_type) {
       const chip = el('span', 'audio-chip', item.plot_type);
       chip.style.background = plotColor(item.plot_type);
@@ -183,8 +187,51 @@ function renderAudio(items, body) {
     const dets = Array.isArray(item.detections) ? item.detections : [];
     const ctx = item.recording_context && typeof item.recording_context === 'object'
       ? item.recording_context : null;
+    const sctx = item.species_context && typeof item.species_context === 'object'
+      ? item.species_context : null;
 
-    if (dets.length) {
+    // Species-named clip: the identification is the researcher's, and the
+    // counts describe the species across the whole season. Label the scope
+    // explicitly so a season total is never read as a count for this clip.
+    if (sctx) {
+      meta.appendChild(el('p', 'det-title', 'This species across the 2026 season'));
+      const bits = [];
+      if (Number.isFinite(Number(sctx.n_detections))) {
+        bits.push(`${fmtInt(sctx.n_detections)} unvalidated BirdNET detections`);
+      }
+      if (Number.isFinite(Number(sctx.n_plots))) {
+        bits.push(`at ${fmtInt(sctx.n_plots)} of 35 ARU plots`);
+      }
+      if (bits.length) meta.appendChild(el('p', 'audio-caption', bits.join(' ') + '.'));
+
+      const byPt = sctx.by_plot_type && typeof sctx.by_plot_type === 'object'
+        ? sctx.by_plot_type : null;
+      if (byPt) {
+        const total = Object.values(byPt).reduce((a, b) => a + Number(b || 0), 0);
+        const rows = orderPlotTypes(Object.keys(byPt));
+        const bars = el('div', 'ctx-bars');
+        for (const pt of rows) {
+          const n = Number(byPt[pt] || 0);
+          const pct = total > 0 ? (100 * n / total) : 0;
+          const row = el('div', 'ctx-row');
+          row.appendChild(el('span', 'ctx-label', pt));
+          const track = el('span', 'ctx-track');
+          const fill = el('span', 'ctx-fill');
+          fill.style.width = `${pct.toFixed(1)}%`;
+          fill.style.background = plotColor(pt);
+          track.appendChild(fill);
+          row.appendChild(track);
+          row.appendChild(el('span', 'ctx-value',
+            `${fmtInt(n)} (${pct.toFixed(0)}%)`));
+          bars.appendChild(row);
+        }
+        meta.appendChild(bars);
+        meta.appendChild(el('p', 'panel-note',
+          'Detections by plot type for this species over the whole season, ' +
+          'not for this clip. Uncorrected for differences in recording effort ' +
+          'among plots.'));
+      }
+    } else if (dets.length) {
       meta.appendChild(el('p', 'det-title', 'BirdNET detections in this clip'));
       meta.appendChild(detList(dets));
     } else if (ctx) {
