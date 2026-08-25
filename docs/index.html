@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Timbermill Wind &amp; Wildlife &mdash; preliminary sensor summaries</title>
+<meta name="robots" content="noindex, nofollow">
+<meta name="description" content="Preliminary, unvalidated wildlife sensor summaries from the Timbermill wind energy study, Chowan County, North Carolina.">
+
+<link rel="stylesheet" href="./assets/vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="./assets/css/dashboard.css">
+</head>
+<body>
+
+<!-- ============ PRELIMINARY DATA BANNER (sticky, text from manifest.disclaimer) ============ -->
+<div id="disclaimer-banner" class="disclaimer" role="alert">
+  <div class="disclaimer-inner">
+    <span class="disclaimer-tag">Preliminary data</span>
+    <p class="disclaimer-text" id="disclaimer-text">Loading data-use statement&hellip;</p>
+  </div>
+</div>
+
+<!-- ============ ENVIRONMENT WARNING (local file:// use) ============ -->
+<div id="boot-warning" class="boot-warning" hidden>
+  <div class="wrap">
+    <h2 class="boot-warning-title">This page needs to be served over HTTP</h2>
+    <p>The dashboard reads its numbers from <code>./data/*.json</code> at runtime. Browsers block
+       those reads (and ES module loading) when a page is opened directly from disk as
+       <code>file://</code>, so no panel can populate in this mode.</p>
+    <p>From the <code>docs/</code> directory, run a local server and reload from the address it prints:</p>
+    <pre><code>python3 -m http.server 8000</code></pre>
+    <p>Then open <a href="http://localhost:8000/">http://localhost:8000/</a>. Published to GitHub Pages,
+       the site is served over HTTPS and works without any of this.</p>
+  </div>
+</div>
+
+<header class="site-header">
+  <div class="wrap">
+    <p class="eyebrow" id="header-season">Field season &mdash;</p>
+    <h1 id="header-title">Timbermill Wind &amp; Wildlife</h1>
+    <p class="subtitle" id="header-subtitle"></p>
+    <p class="byline">
+      <span id="header-investigator"></span>
+      <span class="sep" aria-hidden="true">&middot;</span>
+      <span class="generated">Summaries generated <span id="header-generated">&mdash;</span></span>
+    </p>
+  </div>
+</header>
+
+<!-- ============ VIEW TOGGLE (built from manifest.views) ============ -->
+<nav class="viewbar" aria-label="Sensor data views">
+  <div class="wrap">
+    <div id="view-toggle" class="view-toggle" role="tablist" aria-label="Sensor data views">
+      <p class="muted loading-inline">Loading views&hellip;</p>
+    </div>
+  </div>
+</nav>
+
+<main id="main" class="wrap" tabindex="-1">
+
+  <!-- fatal load failure -->
+  <div id="fatal" class="panel panel-error" hidden>
+    <h2>Dashboard summaries could not be loaded</h2>
+    <p id="fatal-detail"></p>
+  </div>
+
+  <!-- ============ PENDING VIEW EMPTY STATE ============ -->
+  <section id="pending-view" class="view-section" hidden>
+    <div class="panel pending-panel">
+      <p class="pending-flag">Planned &mdash; data not yet available</p>
+      <h2 id="pending-title">&mdash;</h2>
+      <dl class="pending-meta">
+        <div><dt>Target taxa</dt><dd id="pending-taxa">&mdash;</dd></div>
+        <div><dt>Instrument</dt><dd id="pending-sensor">&mdash;</dd></div>
+        <div><dt>Status</dt><dd id="pending-status">&mdash;</dd></div>
+      </dl>
+      <p class="pending-note" id="pending-note"></p>
+      <p class="pending-foot">This view is part of the planned analysis. It will populate automatically
+        once the pipeline in <code>build/build_summaries.py</code> emits summaries for it &mdash; the
+        dashboard builds its view list from <code>data/manifest.json</code>, so no page edits are needed.</p>
+    </div>
+  </section>
+
+  <!-- ============ AVAILABLE VIEW ============ -->
+  <section id="data-view" class="view-section" hidden>
+
+    <!-- headline stats -->
+    <div class="view-heading">
+      <h2 id="view-title">&mdash;</h2>
+      <p class="view-taxa" id="view-taxa"></p>
+    </div>
+    <div id="stat-strip" class="stat-strip"></div>
+
+    <!-- MAP -->
+    <section class="panel" id="panel-map" aria-labelledby="h-map">
+      <div class="panel-head">
+        <h3 id="h-map">Sensor locations</h3>
+        <p class="panel-sub" id="map-sub"></p>
+      </div>
+      <p class="precision-note" id="map-precision-note"></p>
+      <div id="map" class="map" role="application" aria-label="Map of approximate sensor locations"></div>
+      <div id="map-legend" class="legend" aria-label="Plot type legend"></div>
+      <p class="panel-note" id="map-basemap-note" hidden></p>
+      <p class="panel-note" id="map-note"></p>
+      <div class="panel-error-slot" id="map-error" hidden></div>
+    </section>
+
+    <!-- EFFORT -->
+    <section class="panel" id="panel-effort" aria-labelledby="h-effort">
+      <div class="panel-head">
+        <h3 id="h-effort">Survey effort</h3>
+        <p class="panel-sub" id="effort-sub"></p>
+      </div>
+      <div id="effort-stats" class="mini-stats"></div>
+      <div id="effort-chart" class="chart chart-effort"></div>
+      <p class="panel-note" id="effort-note"></p>
+      <div class="panel-error-slot" id="effort-error" hidden></div>
+    </section>
+
+    <!-- SPECIES -->
+    <section class="panel" id="panel-species" aria-labelledby="h-species">
+      <div class="panel-head">
+        <h3 id="h-species">Species detected</h3>
+        <p class="panel-sub" id="species-sub"></p>
+      </div>
+      <div class="controls" id="species-controls">
+        <label class="control">
+          <span>Show</span>
+          <select id="species-topn">
+            <option value="15">Top 15</option>
+            <option value="25" selected>Top 25</option>
+            <option value="50">Top 50</option>
+            <option value="all">All species</option>
+          </select>
+        </label>
+        <label class="control">
+          <span>Sort by</span>
+          <select id="species-sort">
+            <option value="count_desc" selected>Detections (high to low)</option>
+            <option value="count_asc">Detections (low to high)</option>
+            <option value="name_asc">Common name (A&ndash;Z)</option>
+            <option value="plots_desc">Number of plots</option>
+          </select>
+        </label>
+        <label class="control">
+          <span>Breakdown</span>
+          <select id="species-stack">
+            <option value="stacked" selected>Stacked by plot type</option>
+            <option value="total">Total only</option>
+          </select>
+        </label>
+        <label class="control" id="species-threshold-wrap" hidden>
+          <span>Confidence</span>
+          <select id="species-threshold"></select>
+        </label>
+      </div>
+      <div id="species-chart" class="chart chart-species"></div>
+      <p class="panel-note" id="species-note"></p>
+      <div class="panel-error-slot" id="species-error" hidden></div>
+    </section>
+
+    <!-- VALIDATION (bird_frog_audio only) -->
+    <section class="panel" id="panel-validation" aria-labelledby="h-validation" hidden>
+      <div class="panel-head">
+        <h3 id="h-validation">Validation progress</h3>
+        <p class="panel-sub" id="validation-sub"></p>
+      </div>
+      <div id="validation-overall" class="validation-overall"></div>
+      <p class="panel-note" id="validation-note"></p>
+      <div class="table-scroll">
+        <table class="data-table" id="validation-table">
+          <caption class="table-caption" id="validation-caption"></caption>
+          <thead><tr id="validation-head"></tr></thead>
+          <tbody id="validation-body"></tbody>
+        </table>
+      </div>
+      <p class="panel-note" id="validation-foot"></p>
+      <div class="panel-error-slot" id="validation-error" hidden></div>
+    </section>
+
+    <!-- MEDIA -->
+    <section class="panel" id="panel-media" aria-labelledby="h-media">
+      <div class="panel-head">
+        <h3 id="h-media">Example media</h3>
+        <p class="panel-sub" id="media-sub"></p>
+      </div>
+      <div id="media-body" class="media-body"></div>
+      <div class="panel-error-slot" id="media-error" hidden></div>
+    </section>
+
+  </section>
+</main>
+
+<!-- lightbox for photo galleries -->
+<div id="lightbox" class="lightbox" hidden role="dialog" aria-modal="true" aria-label="Enlarged photograph">
+  <button type="button" class="lightbox-close" id="lightbox-close" aria-label="Close">&times;</button>
+  <figure class="lightbox-figure">
+    <img id="lightbox-img" alt="">
+    <figcaption>
+      <p class="lightbox-species"><span id="lightbox-common"></span> <em id="lightbox-latin"></em></p>
+      <p class="lightbox-caption" id="lightbox-caption"></p>
+      <p class="lightbox-credit" id="lightbox-credit"></p>
+    </figcaption>
+  </figure>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <section class="foot-block">
+      <h2>Annotation progress</h2>
+      <div id="foot-annotation" class="foot-stats"></div>
+      <p class="panel-note" id="foot-annotation-note"></p>
+    </section>
+    <section class="foot-block">
+      <h2>Data sources</h2>
+      <p id="foot-sources" class="foot-text"></p>
+      <p class="foot-text">Published summaries are regenerated by <code>build/build_summaries.py</code>,
+        which reads the raw sensor archives locally and writes only aggregated tables to
+        <code>docs/data/</code>. Raw detection records, original media, and full-precision coordinates
+        are never published.</p>
+      <p class="foot-text" id="foot-generated"></p>
+    </section>
+  </div>
+</footer>
+
+<!-- Boot guard: runs as a classic script so it executes even if ES modules are blocked. -->
+<script>
+  (function () {
+    var isFile = window.location.protocol === 'file:';
+    if (isFile) {
+      var w = document.getElementById('boot-warning');
+      if (w) w.hidden = false;
+    }
+    // If the module never signals startup, surface a message rather than a blank page.
+    window.setTimeout(function () {
+      if (!window.__dashboardBooted) {
+        var f = document.getElementById('fatal');
+        var fd = document.getElementById('fatal-detail');
+        if (f && fd && f.hidden) {
+          f.hidden = false;
+          fd.textContent = isFile
+            ? 'The page scripts did not start because it was opened directly from disk. Serve the docs/ directory over HTTP (see the note above) and reload.'
+            : 'The page scripts did not start. Check that assets/js/main.js is present alongside index.html and that the browser console shows no load errors.';
+        }
+      }
+    }, 6000);
+  })();
+</script>
+
+<!-- Libraries are vendored locally rather than loaded from a CDN: the site must
+     render with no network access (conference wifi, an offline laptop, or a
+     reviewer opening index.html straight from disk). -->
+<script src="./assets/vendor/leaflet/leaflet.js" defer></script>
+<script src="./assets/vendor/plotly.min.js" charset="utf-8" defer></script>
+<script type="module" src="./assets/js/main.js"></script>
+</body>
+</html>

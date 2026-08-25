@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+# Timbermill Wind & Wildlife dashboard
+#
+# PRELIMINARY DATA POLICY: nothing raw is published. The build pipeline reads
+# raw_data/ locally and writes only aggregated summaries into docs/data/.
+# Everything below must never reach the public repository.
+# ---------------------------------------------------------------------------
+
+# Raw sensor data (Wildlife Insights exports, BirdNET detections, media, coords)
+raw_data/
+
+# Full-precision coordinates and any other local-only intermediate
+private/
+
+# Original (untranscoded, EXIF-bearing) media staging
+docs/media/**/*_original.*
+
+# Screenshot / probe scratch left at the repo root by verification runs
+/shot.py
+/shot_*.png
+/Data_Dashboard_Prompt
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.Python
+*.egg-info/
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# R
+# ---------------------------------------------------------------------------
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# ---------------------------------------------------------------------------
+# OS / editor cruft
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.vscode/
+.idea/
+
+# ---------------------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------------------
+*.log
+build/logs/
