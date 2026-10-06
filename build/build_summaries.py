@@ -2,22 +2,39 @@
 """
 Timbermill Wind & Wildlife -- dashboard summary pipeline.
 
-Reads the raw, preliminary sensor data in ``raw_data/`` and writes ONLY
-aggregated summaries into ``docs/data/``. No individual detection record, no
-raw media, and no full-precision coordinate ever reaches ``docs/``.
+Reads the raw, preliminary sensor data in ``data/`` and writes ONLY aggregated
+summaries into ``docs/data/``. No individual detection record, no raw media,
+and no full-precision coordinate ever reaches ``docs/``.
 
 Run from the repository root:
 
     python build/build_summaries.py
 
+Data sources, and which view each one backs:
+
+    data/Clean_AHDriFT_Data/ahdrift_data_cleaned.csv
+        bucket_camera. One row per motion-capture detection event, plus one
+        "No Detections" row per surveyed plot-day, which is what makes real
+        survey effort (and therefore detection rate and naive occupancy)
+        computable for the AHDriFT arrays. This file -- not the Wildlife
+        Insights export -- is authoritative for the bucket cameras.
+    data/WI_Download/
+        parallel_camera only. sequences.csv filtered to the CT deployments.
+    data/Bird_Frog_Audio_Summaries/preliminary_BirdNET_Results.csv
+        bird_frog_audio. 3.6 M raw classifier detections.
+    data/Bird_Frog_Audio_Summaries/BirdNet_Thresholds.csv
+        Per-species confidence cutoffs from listening to 150 clips per
+        species. Species are split into validation groups from this file and
+        the validated ones are filtered to their own cutoff.
+
 Outputs (all JSON, all safe to publish):
 
-    docs/data/manifest.json        build metadata, view registry, headline totals
-    docs/data/locations.json       jittered + rounded sensor coordinates
-    docs/data/effort.json          per-deployment durations by plot type
-    docs/data/species_ahdrift.json bucket-camera (AHDriFT) species tallies
-    docs/data/species_parallel.json parallel-camera species tallies
-    docs/data/birdnet.json         BirdNET species tallies + validation progress
+    docs/data/manifest.json         build metadata, view registry, headline totals
+    docs/data/locations.json        jittered coordinates + per-point species tallies
+    docs/data/effort.json           survey effort by view
+    docs/data/species_ahdrift.json  AHDriFT species, activity, rate vs occupancy
+    docs/data/species_parallel.json parallel-camera equivalents
+    docs/data/birdnet.json          BirdNET species by validation group + activity
 """
 
 from __future__ import annotations
@@ -39,70 +56,74 @@ import pandas as pd
 # Paths
 # --------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parents[1]
-RAW = ROOT / "raw_data"
-WI_DIR = RAW / "WI_Download" / "WI_Data_20260823"
+RAW = ROOT / "data"
+WI_DIR = RAW / "WI_Download"
+AH_CSV = RAW / "Clean_AHDriFT_Data" / "ahdrift_data_cleaned.csv"
+TH_CSV = RAW / "Bird_Frog_Audio_Summaries" / "BirdNet_Thresholds.csv"
+BN_CSV = RAW / "Bird_Frog_Audio_Summaries" / "preliminary_BirdNET_Results.csv"
+LOC_CSV = RAW / "Locations" / "cam_trap_locations_info.csv"
 OUT = ROOT / "docs" / "data"
-PRIVATE = ROOT / "private"
-VALIDATION_LOG = ROOT / "build" / "validation_log.csv"
 
 # --------------------------------------------------------------------------
 # Privacy controls
 # --------------------------------------------------------------------------
 # Published coordinates are rounded to COORD_DECIMALS and then displaced by a
-# deterministic per-point offset of up to JITTER_DEG degrees. Deterministic
-# means the same point lands in the same place on every rebuild (so the map is
-# stable) while never revealing the true location. Full-precision coordinates
-# stay in raw_data/ and private/, both git-ignored.
+# deterministic per-point offset. Deterministic means the same point lands in
+# the same place on every rebuild (so the map is stable) while never revealing
+# the true location. Full-precision coordinates stay in data/, git-ignored.
 COORD_DECIMALS = 3
-# Offsets are applied as a polar vector with a guaranteed minimum radius, so
-# no published point can land close to its true position by chance (which
-# independent per-axis jitter allows when the offsets cancel the rounding).
 JITTER_MIN_M = 40.0
 JITTER_MAX_M = 110.0
 
-# BirdNET confidence thresholds reported on the dashboard. 0.25 is the liberal
-# prospectus threshold fed to the false-positive model; the higher bins show how
-# quickly the detection pool shrinks as the threshold tightens.
-BIRDNET_THRESHOLDS = [0.25, 0.50, 0.75, 0.90]
+# --------------------------------------------------------------------------
+# Activity-pattern binning
+# --------------------------------------------------------------------------
+# Time-of-day histograms are published as counts in half-hour bins; the
+# frontend smooths them into the activity curves. Half-hour bins are fine
+# enough to resolve a dawn peak and coarse enough that a single species with a
+# few hundred detections still gives a readable curve.
+ACT_BINS = 48
+ACT_BIN_SECONDS = 86400 // ACT_BINS
 
-# ---- Validation design ---------------------------------------------------
-# 150 recordings are validated per species, drawn STRATIFIED across confidence
-# bins, and a logistic regression of true-positive outcome on BirdNET
-# confidence gives the threshold at which P(true positive) = 0.95. Detections
-# at or above that fitted cutoff are the positives carried into the
-# multi-species occupancy model.
-#
-# Stratifying matters here: raw confidences are heavily skewed toward the 0.25
-# floor (median 0.43), so a simple random 150 would place almost no
-# validations near the crossing point and the cutoff would be extrapolated
-# rather than estimated. Equal allocation per bin puts data on both sides of
-# it. The consequence is that validated detections are NOT a random sample of
-# all detections, so the pooled validated precision is not the dataset
-# precision -- the fitted curve is the object of interest, and per-bin
-# precision is reported instead of a pooled average.
-VALIDATION_N_PER_SPECIES = 150
-VALIDATION_TARGET_P = 0.95
-
-# Bin edges over the retained confidence range. Eight bins at 150 per species
-# is ~19 validations per bin.
-VALIDATION_BIN_EDGES = [0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 1.001]
-
-# Detections at or above this confidence make up the pool eligible for
-# validation, matching the liberal BirdNET threshold in the prospectus.
-VALIDATION_POOL_THRESHOLD = 0.25
+# ARU recordings come in two lengths; the schedule runs 5-minute files through
+# most of the night and a 60-minute file over the dawn chorus. Detections are
+# timestamped within their file, so a file's length is inferred from the
+# largest detection offset it contains: the two populations are cleanly
+# separated (no file in the whole dataset has a maximum offset between 300 and
+# 310 s). The residual error is a 60-minute file whose only detections fall in
+# its first five minutes, which would be scored as a 5-minute file and
+# slightly under-count effort in that bin.
+ARU_SHORT_SECONDS = 300
+ARU_LONG_SECONDS = 3600
+ARU_DURATION_SPLIT = 310
 
 # Non-wildlife / non-identification labels excluded from species tallies.
 NON_SPECIES_LABELS = {
     "no cv result", "blank", "vehicle", "animal", "unknown", "",
     "human", "homo sapiens", "camera trapper", "setup/pickup",
+    "official vehicle", "no detections",
 }
-# Labels that are real detections but not resolved to a useful taxon; kept out
-# of the species bar chart but counted separately so nothing silently vanishes.
+# Labels that are real detections but not resolved to a useful taxon. These
+# are counted separately so nothing silently vanishes, and kept out of the
+# species chart -- except in the AHDriFT file, where the researcher's cleaned
+# species list is taken as final and its genus-level labels ("Plestiodon
+# Species") are real analysis units.
 COARSE_LABELS = {
     "mammal", "bird", "insect", "spider", "rodent", "reptile", "amphibian",
-    "hymenoptera order", "snake", "lizard", "turtle", "frog", "toad",
-    "arachnid", "millipede", "centipede", "snail", "slug",
+    "snake", "lizard", "turtle", "frog", "toad", "frogs", "toads", "bat",
+    "bats", "arachnid", "arachnids", "millipede", "centipede", "snail",
+    "slug", "small mammal", "large mammal", "butterflies and moths",
+    "bumblebees", "dragonflies and damselflies",
 }
+# Wildlife Insights also emits rank-named labels ("Passeriformes Order",
+# "Cathartidae Family"). Those are above genus and cannot anchor a species
+# row, so they are excluded by rank suffix rather than by enumeration -- a new
+# family label in a future export is then handled without a code change.
+# Genus-level "<Genus> Species" labels are NOT excluded: they are the same
+# kind of unit as the cleaned AHDriFT list's "Plestiodon Species" and are
+# real analysis units.
+COARSE_RANK_SUFFIXES = (" order", " family", " suborder", " superfamily",
+                        " subfamily", " tribe", " class", " phylum")
 
 PLOT_TYPES = {
     "TO": "Turbine Opening",
@@ -112,6 +133,19 @@ PLOT_TYPES = {
 }
 PLOT_TYPE_ORDER = ["Turbine Opening", "Turbine Edge", "Interior Forest",
                    "Reference Edge"]
+
+# Taxonomic classes, in the order the class filter should offer them.
+CLASS_ORDER = ["Mammalia", "Aves", "Reptilia", "Amphibia", "Insecta",
+               "Arachnida"]
+
+CLASS_LABELS = {
+    "Mammalia": "Mammals",
+    "Aves": "Birds",
+    "Reptilia": "Reptiles",
+    "Amphibia": "Amphibians",
+    "Insecta": "Insects",
+    "Arachnida": "Arachnids",
+}
 
 
 # --------------------------------------------------------------------------
@@ -128,12 +162,13 @@ def norm_key(s) -> str:
 
 def plot_code(name) -> str | None:
     """Leading plot code from a placename or deployment id, e.g. 'TE03'."""
-    m = re.match(r"([A-Z]{2})\s*0*(\d+)", str(name).upper())
+    m = re.match(r"([A-Za-z]{2})\s*0*(\d+)", str(name).strip())
     if not m:
         return None
-    if m.group(1) not in PLOT_TYPES:
+    code = m.group(1).upper()
+    if code not in PLOT_TYPES:
         return None
-    return f"{m.group(1)}{int(m.group(2)):02d}"
+    return f"{code}{int(m.group(2)):02d}"
 
 
 def plot_type_of(name) -> str | None:
@@ -167,29 +202,31 @@ def canon_plot_type(s) -> str | None:
     return str(s).strip()
 
 
+def class_rank(k) -> int:
+    try:
+        return CLASS_ORDER.index(str(k))
+    except ValueError:
+        return len(CLASS_ORDER)
+
+
 def jitter(point_id: str, lat: float, lon: float) -> tuple[float, float]:
     """Deterministic, stable coordinate obfuscation.
 
-    The true position is rounded, then displaced along a pseudo-random bearing
-    by a distance drawn from [JITTER_MIN_M, JITTER_MAX_M]. Keying the offset on
-    the point id makes it identical on every rebuild, so the map does not
-    shuffle between builds, while the enforced minimum radius guarantees no
-    published marker sits on top of a real sensor.
+    The true position is displaced along a pseudo-random bearing and then
+    rounded. Keying the offset on the point id makes it identical on every
+    rebuild, so the map does not shuffle between builds, while the enforced
+    minimum radius guarantees no published marker sits on a real sensor.
+    Rounding can pull a point back toward its true position, so the
+    displacement is re-measured after rounding and the draw repeated with a
+    wider radius until the floor actually holds.
     """
     m_per_deg_lat = 111_320.0
     m_per_deg_lon = m_per_deg_lat * max(math.cos(math.radians(lat)), 0.1)
 
-    # Displace the TRUE coordinate, then round. Rounding to COORD_DECIMALS
-    # quantizes the result onto a ~100 m grid, which can pull a point back
-    # toward its true position, so the displacement is re-measured AFTER
-    # rounding and the draw is repeated with a wider radius until the floor
-    # actually holds. The attempt counter feeds the hash, so the outcome stays
-    # deterministic across rebuilds.
     for attempt in range(64):
         h = hashlib.sha256(f"timbermill/{point_id}/{attempt}".encode()).digest()
         bearing = int.from_bytes(h[0:4], "big") / 2**32 * 2 * math.pi
         frac = int.from_bytes(h[4:8], "big") / 2**32
-        # sqrt keeps the draws area-uniform within the annulus.
         lo_m = JITTER_MIN_M + attempt * 5.0
         radius = math.sqrt(lo_m**2 + frac * max(JITTER_MAX_M**2 - lo_m**2, 0.0))
 
@@ -208,7 +245,9 @@ def is_species_label(name) -> bool:
     if name is None or (isinstance(name, float) and math.isnan(name)):
         return False
     t = str(name).strip().lower()
-    return bool(t) and t not in NON_SPECIES_LABELS and t not in COARSE_LABELS
+    if not t or t in NON_SPECIES_LABELS or t in COARSE_LABELS:
+        return False
+    return not t.endswith(COARSE_RANK_SUFFIXES)
 
 
 def count_lines(path: Path) -> int:
@@ -222,96 +261,50 @@ def count_lines(path: Path) -> int:
             return max(sum(1 for _ in fh) - 1, 0)
 
 
-def bin_index(conf: float) -> int:
-    """Confidence -> validation stratum index, or -1 below the pool floor."""
-    for i in range(len(VALIDATION_BIN_EDGES) - 1):
-        if VALIDATION_BIN_EDGES[i] <= conf < VALIDATION_BIN_EDGES[i + 1]:
-            return i
-    return -1
+def act_bin(hour, minute=0, second=0) -> int | None:
+    """Clock time -> half-hour bin index, or None when the time is missing."""
+    try:
+        h = int(hour)
+    except (TypeError, ValueError):
+        return None
+    if h < 0:
+        return None
+    secs = (h * 3600 + int(minute or 0) * 60 + int(second or 0)) % 86400
+    return int(secs // ACT_BIN_SECONDS)
 
 
-def bin_label(i: int) -> str:
-    lo = VALIDATION_BIN_EDGES[i]
-    hi = VALIDATION_BIN_EDGES[i + 1]
-    hi = min(hi, 1.0)
-    return f"{lo:.2f}-{hi:.2f}"
+def empty_bins() -> list[int]:
+    return [0] * ACT_BINS
 
 
-def fit_logistic_cutoff(rows):
-    """Fit P(true positive) ~ confidence and solve for VALIDATION_TARGET_P.
+def pack_activity(d: dict) -> dict:
+    """Drop all-zero plot-type rows so the published arrays stay small."""
+    return {k: v for k, v in d.items() if any(v)}
 
-    ``rows`` is a list of (confidence, n_checked, n_true_positive) at the bin
-    level; the fit is on grouped binomial data, which is what a per-bin
-    validation tally gives you. Newton-Raphson on the two-parameter logit --
-    small, dependency-free, and the design matrix is Nx2, so this converges in
-    a handful of iterations.
 
-    Returns None when the data cannot identify a cutoff: fewer than two bins
-    with validations, no variation in outcome, a non-increasing fit, or a
-    crossing point outside the confidence range. Reporting "not yet
-    identifiable" is correct in those cases -- a number extrapolated from one
-    bin would look like a result without being one.
+def latin_from_pairs(pairs) -> str | None:
+    """Latin name for a common-name group, from its (genus, species) pairs.
+
+    A cleaned species list contains genus-level units ("Plestiodon Species")
+    and one lumped pair ("Peromyscus or Ochrotomys Species"). Those get a
+    genus-level name or none at all rather than an invented binomial.
+
+    A binomial is published only when EVERY row of the group carries the same
+    one. A group whose rows are a mix of bare genus and one named epithet --
+    "Plestiodon Species", where some individuals were resolved to laticeps and
+    others were not -- is a genus-level unit, and naming it for the epithet
+    that happens to appear would assert an identification the researcher
+    deliberately declined to make.
     """
-    pts = [(float(c), int(n), int(k)) for c, n, k in rows if int(n) > 0]
-    if len({c for c, _, _ in pts}) < 2:
-        return None
-    total_n = sum(n for _, n, _ in pts)
-    total_k = sum(k for _, _, k in pts)
-    if total_k == 0 or total_k == total_n:
-        return None  # no variation: the fit is degenerate
-
-    b0, b1 = 0.0, 0.0
-    for _ in range(200):
-        # Score vector and Fisher information for the logit likelihood.
-        g0 = g1 = h00 = h01 = h11 = 0.0
-        for c, n, k in pts:
-            eta = b0 + b1 * c
-            eta = max(min(eta, 30.0), -30.0)
-            p = 1.0 / (1.0 + math.exp(-eta))
-            w = n * p * (1.0 - p)
-            r = k - n * p
-            g0 += r
-            g1 += r * c
-            h00 += w
-            h01 += w * c
-            h11 += w * c * c
-        det = h00 * h11 - h01 * h01
-        if abs(det) < 1e-12:
-            return None
-        d0 = (h11 * g0 - h01 * g1) / det
-        d1 = (h00 * g1 - h01 * g0) / det
-        b0 += d0
-        b1 += d1
-        if max(abs(d0), abs(d1)) < 1e-9:
-            break
-    else:
-        return None
-
-    if b1 <= 0:
-        # Precision not increasing with confidence -- the premise of a
-        # threshold does not hold for this species yet.
-        return {"slope": round(b1, 4), "intercept": round(b0, 4),
-                "cutoff": None,
-                "reason": "fitted precision does not increase with confidence"}
-
-    logit_t = math.log(VALIDATION_TARGET_P / (1.0 - VALIDATION_TARGET_P))
-    cutoff = (logit_t - b0) / b1
-    out = {"slope": round(b1, 4), "intercept": round(b0, 4),
-           "n_validated": total_n, "n_true_positive": total_k,
-           "n_bins": len(pts)}
-    if cutoff > 1.0:
-        out["cutoff"] = None
-        out["reason"] = (f"P={VALIDATION_TARGET_P:.2f} is not reached within "
-                         f"the confidence range (extrapolates to "
-                         f"{cutoff:.2f})")
-    elif cutoff < VALIDATION_POOL_THRESHOLD:
-        # Already above target everywhere retained; the floor is the cutoff.
-        out["cutoff"] = round(VALIDATION_POOL_THRESHOLD, 3)
-        out["reason"] = (f"fit reaches P={VALIDATION_TARGET_P:.2f} below the "
-                         f"retained floor; floor applies")
-    else:
-        out["cutoff"] = round(cutoff, 3)
-    return out
+    genera = sorted({g for g, _ in pairs if g})
+    full = sorted({f"{g} {s}" for g, s in pairs if g and s})
+    if len(full) == 1 and all(s for _, s in pairs) and len(genera) == 1:
+        return full[0]
+    if len(genera) == 1:
+        return f"{genera[0]} sp."
+    if genera:
+        return " / ".join(f"{g} sp." for g in genera)
+    return None
 
 
 def write_json(name: str, payload) -> None:
@@ -324,41 +317,984 @@ def write_json(name: str, payload) -> None:
 
 
 # --------------------------------------------------------------------------
-# 1. Locations
+# 1. AHDriFT bucket cameras -- from the researcher's cleaned detection table
 # --------------------------------------------------------------------------
-def build_locations() -> tuple[dict, pd.DataFrame]:
-    src = RAW / "Locations" / "cam_trap_locations_info.csv"
-    df = pd.read_csv(src)
+def build_ahdrift() -> dict:
+    """Species, activity, effort and rate-vs-occupancy for the bucket cameras.
+
+    The cleaned table carries one row per motion-capture detection event and
+    one "No Detections" row per surveyed plot-day, so the plot-day set IS the
+    survey effort: every plot-day in the file was reviewed, and the ones that
+    produced nothing are explicitly recorded rather than inferred from gaps.
+    That is what makes an honest detection rate and naive occupancy possible
+    here, which the Wildlife Insights export alone does not support.
+
+    Detection events are the unit throughout. ``n.Seq`` and ``Max.Group.Size``
+    are zero in every row of the current export, so neither is used; counting
+    rows is the only defensible unit and the published note says so.
+    """
+    df = pd.read_csv(AH_CSV)
+    n_rows_raw = len(df)
+
+    df["plot"] = df["Plot.ID"].astype(str).str.strip()
+    df["plot_type"] = df["plot"].map(plot_type_of)
+    df["Class"] = df["Class"].astype(str).str.strip()
+    df["common_name"] = df["Common.Name"].astype(str).str.strip()
+    df["huts"] = pd.to_numeric(df["Huts.Active"], errors="coerce").fillna(0)
+
+    blank = df["common_name"].str.lower() == "no detections"
+    det = df.loc[~blank].copy()
+    n_seq_col_unused = bool((pd.to_numeric(df["n.Seq"], errors="coerce")
+                             .fillna(0) == 0).all())
+
+    # ---- effort: one record per plot, from the plot-day rows ---------------
+    # Huts.Active is constant within a plot-day in the current export, so the
+    # first value per plot-day is the whole story.
+    pday = (df.groupby(["plot", "Date"])
+              .agg(huts=("huts", "max"), plot_type=("plot_type", "first"))
+              .reset_index())
+    effort_rows = []
+    for plot, g in pday.groupby("plot"):
+        effort_rows.append({
+            "view": "bucket_camera",
+            "deployment_id": plot,
+            "plot": plot,
+            "plot_type": g["plot_type"].iloc[0],
+            "sensor_type": "AHDriFT",
+            "start": str(g["Date"].min()),
+            "end": str(g["Date"].max()),
+            "days": int(len(g)),
+            "hut_days": int(g["huts"].sum()),
+            "functioning": None,
+        })
+    effort_rows.sort(key=lambda r: r["plot"])
+    total_array_days = sum(r["days"] for r in effort_rows)
+    total_hut_days = sum(r["hut_days"] for r in effort_rows)
+    sites = sorted({r["plot"] for r in effort_rows})
+    n_sites = len(sites)
+
+    # ---- timestamps -------------------------------------------------------
+    # Time.Start is written with a trailing Z but holds camera-local clock
+    # time, so it is read with no UTC conversion. Checked at record level
+    # rather than by eye: joining each cleaned detection to the Wildlife
+    # Insights AHDriFT sequences on (plot, instant) matches all 1,707 with no
+    # offset, while a +/-4 h shift matches 1 of 1,707. Treating the Z as real
+    # would move every curve four hours and turn a nocturnal small-mammal
+    # peak into an afternoon one.
+    ts = pd.to_datetime(det["Time.Start"], format="ISO8601", errors="coerce",
+                        utc=True)
+    det["hour"] = ts.dt.hour
+    det["minute"] = ts.dt.minute
+    det["second"] = ts.dt.second
+    n_no_time = int(ts.isna().sum())
+
+    # ---- per-species rows -------------------------------------------------
+    species = []
+    point_counts = defaultdict(Counter)   # plot -> species -> n
+
+    for name, g in det.groupby("common_name"):
+        klass = next((c for c in g["Class"] if c and c != "nan"), None)
+        pairs = [(str(a).strip() if pd.notna(a) else None,
+                  str(b).strip() if pd.notna(b) else None)
+                 for a, b in zip(g["Genus"], g["Species"])]
+        pairs = [(a if a not in (None, "nan", "NA") else None,
+                  b if b not in (None, "nan", "NA") else None)
+                 for a, b in pairs]
+
+        by_plot_type = Counter(g["plot_type"].dropna())
+        by_plot = Counter(g["plot"])
+        for p, n in by_plot.items():
+            point_counts[p][name] += int(n)
+
+        act = defaultdict(empty_bins)
+        for pt, h, m, s in zip(g["plot_type"], g["hour"], g["minute"],
+                               g["second"]):
+            b = act_bin(h, m, s)
+            if b is None or not pt:
+                continue
+            act[pt][b] += 1
+
+        n_det = int(len(g))
+        n_sites_det = int(g["plot"].nunique())
+        species.append({
+            "common_name": str(name),
+            "latin_name": latin_from_pairs(pairs),
+            "class": klass,
+            "order": None,
+            "n_detections": n_det,
+            "n_plots": n_sites_det,
+            "by_plot_type": {k: int(v) for k, v in by_plot_type.items()},
+            "by_plot": {k: int(v) for k, v in sorted(by_plot.items())},
+            "naive_occupancy_pct": (round(100 * n_sites_det / n_sites, 1)
+                                    if n_sites else None),
+            "n_sites_detected": n_sites_det,
+            "detection_rate_per_100": (round(100 * n_det / total_hut_days, 3)
+                                       if total_hut_days else None),
+            "activity": pack_activity(act),
+            "n_activity_binned": int(sum(sum(v) for v in act.values())),
+        })
+    species.sort(key=lambda r: -r["n_detections"])
+
+    by_class = []
+    for k in sorted({s["class"] for s in species if s["class"]},
+                    key=class_rank):
+        rows = [s for s in species if s["class"] == k]
+        by_class.append({
+            "class": k,
+            "label": CLASS_LABELS.get(k, k),
+            "n_species": len(rows),
+            "n_detections": sum(r["n_detections"] for r in rows),
+        })
+
+    payload = {
+        "source": "data/Clean_AHDriFT_Data/ahdrift_data_cleaned.csv",
+        "unit": "detection events",
+        "note": (
+            "One detection event is one motion-capture sequence of one taxon "
+            "at one AHDriFT array, identified by the researcher. Every "
+            "motion-capture image in the 2026 season has been reviewed, and "
+            "plot-days that produced no detection are recorded explicitly, "
+            "so these counts are complete for the species on the cleaned "
+            "list rather than a work-in-progress tally. Counts are not "
+            "corrected for differences in survey effort among plots; the "
+            "detection-rate panel is."
+        ),
+        "counting_note": (
+            "Events are counted as rows. The cleaned export carries 0 in "
+            "both n.Seq and Max.Group.Size for every row, so neither a "
+            "sequence count nor a group size is used anywhere on this "
+            "dashboard."
+            if n_seq_col_unused else
+            "Events are counted as rows of the cleaned export."
+        ),
+        "n_species": len(species),
+        "n_identified_sequences": int(len(det)),
+        "n_detections": int(len(det)),
+        "n_coarse_sequences": 0,
+        "coarse_note": (
+            "The cleaned list is the researcher's final species set for the "
+            "bucket cameras, so nothing is filtered out here. Three of its "
+            "entries are deliberately genus- or group-level "
+            "(\"Plestiodon Species\", \"Tree Frog Species\", \"Peromyscus or "
+            "Ochrotomys Species\") because those animals cannot be separated "
+            "reliably in a bucket photograph."
+        ),
+        "n_rows_raw": n_rows_raw,
+        "n_blank_plot_days": int(blank.sum()),
+        "n_plot_days": int(len(pday)),
+        "n_plot_days_with_detections": int(det.groupby(["plot", "Date"])
+                                           .ngroups),
+        "n_events_without_time": n_no_time,
+        "date_range": {"first": str(df["Date"].min()),
+                       "last": str(df["Date"].max())},
+        "by_class": by_class,
+        "by_plot_type": [
+            {"plot_type": pt,
+             "n_detections": int((det["plot_type"] == pt).sum()),
+             "n_species": int(det.loc[det["plot_type"] == pt,
+                                      "common_name"].nunique()),
+             "n_plots": int(pday.loc[pday["plot_type"] == pt, "plot"]
+                            .nunique()),
+             "hut_days": int(sum(r["hut_days"] for r in effort_rows
+                                 if r["plot_type"] == pt))}
+            for pt in PLOT_TYPE_ORDER
+        ],
+        "species": species,
+        "rate": {
+            "unit": "detection events per 100 hut-days",
+            "denominator": total_hut_days,
+            "denominator_unit": "hut-days",
+            "note": (
+                "An AHDriFT array is one or two camera huts at a plot; "
+                f"{total_hut_days:,} hut-days were surveyed over "
+                f"{total_array_days:,} array-days at {n_sites} plots. "
+                "Detection rate divides a species' events by that total, so "
+                "plots that ran one hut instead of two are not credited with "
+                "twice the opportunity. Naive occupancy is the percentage of "
+                f"the {n_sites} plots where the species was detected at least "
+                "once -- an observed proportion, uncorrected for imperfect "
+                "detection, so it is a floor on true occupancy, not an "
+                "estimate of it."
+            ),
+            "n_sites": n_sites,
+            "site_unit": "plot",
+            "total_array_days": total_array_days,
+            "total_hut_days": total_hut_days,
+        },
+        "activity": {
+            "bins": ACT_BINS,
+            "bin_seconds": ACT_BIN_SECONDS,
+            "effort_mode": "uniform",
+            "note": (
+                "Bucket cameras run continuously, so detection times need no "
+                "effort correction: every half-hour of the day was watched "
+                "equally. Curves are kernel-smoothed half-hour histograms of "
+                "local clock time, scaled so each one integrates to 1 over "
+                "the 24-hour cycle, which is what makes plot types with very "
+                "different detection totals comparable in shape."
+            ),
+            "timestamp_note": (
+                f"Time.Start in the cleaned export is written with a trailing "
+                f"Z but holds camera-local clock time, not UTC. Read with no "
+                f"conversion, all {len(det):,} detection events match a "
+                f"Wildlife Insights sequence at the same plot and the same "
+                f"instant; applying a 4-hour UTC-to-local shift in either "
+                f"direction matches 1 of {len(det):,}. The curves are "
+                f"therefore on the clock the cameras recorded."
+            ),
+        },
+    }
+    return payload, effort_rows, dict(point_counts)
+
+
+# --------------------------------------------------------------------------
+# 2. Parallel camera traps -- Wildlife Insights sequences, CT deployments only
+# --------------------------------------------------------------------------
+def build_camera_traps(loc: pd.DataFrame) -> tuple[dict, list, dict, dict]:
+    """Species, activity, effort and rate-vs-occupancy for the parallel cameras.
+
+    The Wildlife Insights export is now used for the camera traps ONLY. Its
+    AHDriFT rows are superseded by the cleaned bucket-camera table, which
+    carries the researcher's final identifications and the blank plot-days
+    that the export does not record.
+    """
+    cols = ["deployment_id", "sequence_id", "is_blank", "identified_by",
+            "class", "order", "family", "genus", "species", "common_name",
+            "group_size", "start_time"]
+    seq = pd.read_csv(WI_DIR / "sequences.csv", usecols=cols, low_memory=False)
+    n_seq_total = len(seq)
+    seq["sensor_type"] = seq["deployment_id"].map(sensor_type_of)
+    n_ahdrift_rows = int((seq["sensor_type"] == "AHDriFT").sum())
+
+    dep = pd.read_csv(WI_DIR / "deployments.csv", low_memory=False)
+    dep["sensor_type"] = dep["placename"].map(sensor_type_of)
+    dep["plot"] = dep["placename"].map(plot_code)
+    dep["plot_type"] = dep["placename"].map(plot_type_of)
+    dep["key"] = dep["placename"].map(norm_key)
+    lut = dict(zip(loc["key"], loc["plot_type"]))
+    dep["plot_type"] = dep["plot_type"].fillna(dep["key"].map(lut))
+    dep["start"] = pd.to_datetime(dep["start_date"], errors="coerce")
+    dep["end"] = pd.to_datetime(dep["end_date"], errors="coerce")
+    dep["days"] = (dep["end"] - dep["start"]).dt.total_seconds() / 86400.0
+
+    ct_dep = dep.loc[dep["sensor_type"] == "Camera Trap"].copy()
+    n_dep_raw = len(ct_dep)
+    bad = ct_dep["days"].isna() | (ct_dep["days"] <= 0) | ct_dep["plot_type"].isna()
+    ct_dep = ct_dep.loc[~bad].copy()
+
+    effort_rows = [{
+        "view": "parallel_camera",
+        "deployment_id": str(r.deployment_id),
+        "plot": r.plot,
+        "point": str(r.placename),
+        "point_key": r.key,
+        "plot_type": r.plot_type,
+        "sensor_type": "Camera Trap",
+        "start": r.start.strftime("%Y-%m-%d"),
+        "end": r.end.strftime("%Y-%m-%d"),
+        "days": round(float(r.days), 1),
+        "functioning": (str(r.camera_functioning)
+                        if pd.notna(r.camera_functioning) else None),
+    } for r in ct_dep.itertuples()]
+    effort_rows.sort(key=lambda r: (r["plot_type"] or "", -r["days"]))
+
+    # Sites for naive occupancy are camera POINTS, not plots: a plot carries
+    # three to six parallel cameras and each is an independent station.
+    site_days = defaultdict(float)
+    site_meta = {}
+    for r in effort_rows:
+        site_days[r["point_key"]] += r["days"]
+        site_meta.setdefault(r["point_key"],
+                             {"point": r["point"], "plot": r["plot"],
+                              "plot_type": r["plot_type"]})
+    n_sites = len(site_days)
+    total_camera_days = sum(site_days.values())
+
+    # ---- identifications --------------------------------------------------
+    ident = seq["identified_by"].fillna("")
+    seq["human_reviewed"] = (ident != "") & (ident != "Computer vision")
+    reviewers = {x for x in ident if x and x != "Computer vision"}
+    n_reviewed = int(seq["human_reviewed"].sum())
+
+    ct = seq.loc[(seq["sensor_type"] == "Camera Trap")
+                 & seq["human_reviewed"]].copy()
+    dep_point = dict(zip(dep["deployment_id"], dep["placename"]))
+    ct["point"] = ct["deployment_id"].map(dep_point)
+    ct["point_key"] = ct["point"].map(norm_key)
+    ct["plot"] = ct["deployment_id"].map(plot_code)
+    ct["plot_type"] = ct["deployment_id"].map(plot_type_of)
+    ct["latin"] = (ct["genus"].fillna("").astype(str).str.strip() + " " +
+                   ct["species"].fillna("").astype(str).str.strip()).str.strip()
+    cts = pd.to_datetime(ct["start_time"], errors="coerce")
+    ct["hour"] = cts.dt.hour
+    ct["minute"] = cts.dt.minute
+    ct["second"] = cts.dt.second
+
+    keep = ct["common_name"].map(is_species_label)
+    sp = ct.loc[keep].copy()
+    coarse = ct.loc[~keep & ct["common_name"].notna()]
+
+    species = []
+    point_counts = defaultdict(Counter)
+    for name, g in sp.groupby("common_name"):
+        klass = next((x for x in g["class"].dropna() if x), None)
+        by_plot_type = Counter(g["plot_type"].dropna())
+        by_point = Counter(g["point_key"].dropna())
+        for p, n in by_point.items():
+            point_counts[p][name] += int(n)
+
+        act = defaultdict(empty_bins)
+        for pt, h, m, s in zip(g["plot_type"], g["hour"], g["minute"],
+                               g["second"]):
+            b = act_bin(h, m, s)
+            if b is None or not pt:
+                continue
+            act[pt][b] += 1
+
+        n_det = int(len(g))
+        det_sites = {k for k in by_point if k in site_days}
+        species.append({
+            "common_name": str(name),
+            "latin_name": next((x for x in g["latin"] if x), None),
+            "class": str(klass) if klass else None,
+            "order": (str(g["order"].dropna().iloc[0])
+                      if g["order"].notna().any() else None),
+            "n_sequences": n_det,
+            "n_detections": n_det,
+            "n_plots": int(g["plot"].nunique()),
+            "by_plot_type": {k: int(v) for k, v in by_plot_type.items()},
+            "by_point": {site_meta[k]["point"]: int(v)
+                         for k, v in sorted(by_point.items())
+                         if k in site_meta},
+            "n_sites_detected": len(det_sites),
+            "naive_occupancy_pct": (round(100 * len(det_sites) / n_sites, 1)
+                                    if n_sites else None),
+            "detection_rate_per_100": (round(100 * n_det / total_camera_days, 3)
+                                       if total_camera_days else None),
+            "activity": pack_activity(act),
+            "n_activity_binned": int(sum(sum(v) for v in act.values())),
+        })
+    species.sort(key=lambda r: -r["n_sequences"])
+
+    by_class = []
+    for k in sorted({s["class"] for s in species if s["class"]},
+                    key=class_rank):
+        rows = [s for s in species if s["class"] == k]
+        by_class.append({
+            "class": k,
+            "label": CLASS_LABELS.get(k, k),
+            "n_species": len(rows),
+            "n_detections": sum(r["n_sequences"] for r in rows),
+        })
+
+    payload = {
+        "source": "data/WI_Download/sequences.csv (CT deployments only)",
+        "unit": "sequences",
+        "note": (
+            "A Wildlife Insights sequence is one identification unit -- a "
+            "burst of images of one species at one camera -- not a count of "
+            "individual animals. Only human-reviewed sequences are counted; "
+            "vehicle, blank and human labels are excluded. Counts are not "
+            "corrected for survey effort; the detection-rate panel is."
+        ),
+        "n_species": len(species),
+        "n_identified_sequences": int(len(sp)),
+        "n_detections": int(len(sp)),
+        "n_coarse_sequences": int(len(coarse)),
+        "coarse_note": (
+            "Sequences identified only to a coarse group (\"Bird\", "
+            "\"Rodent\", \"Rabbit and Hare Family\") or to a non-wildlife "
+            "label (vehicle, human, blank) are counted here and excluded "
+            "from the species chart."
+        ),
+        "by_class": by_class,
+        "by_plot_type": [
+            {"plot_type": pt,
+             "n_sequences": int((sp["plot_type"] == pt).sum()),
+             "n_detections": int((sp["plot_type"] == pt).sum()),
+             "n_species": int(sp.loc[sp["plot_type"] == pt,
+                                     "common_name"].nunique()),
+             "n_sites": sum(1 for v in site_meta.values()
+                            if v["plot_type"] == pt),
+             "camera_days": round(sum(d for k, d in site_days.items()
+                                      if site_meta[k]["plot_type"] == pt), 1)}
+            for pt in PLOT_TYPE_ORDER
+        ],
+        "species": species,
+        "rate": {
+            "unit": "sequences per 100 camera-days",
+            "denominator": round(total_camera_days, 1),
+            "denominator_unit": "camera-days",
+            "note": (
+                f"{total_camera_days:,.0f} camera-days were logged across "
+                f"{n_sites} parallel-camera stations. Detection rate divides "
+                "a species' sequences by that total. Naive occupancy is the "
+                f"percentage of the {n_sites} stations -- not the "
+                "50 plots -- where the species was detected at least once, "
+                "an observed proportion uncorrected for imperfect detection, "
+                "so a floor on true occupancy rather than an estimate of it."
+            ),
+            "n_sites": n_sites,
+            "site_unit": "camera station",
+            "total_camera_days": round(total_camera_days, 1),
+        },
+        "activity": {
+            "bins": ACT_BINS,
+            "bin_seconds": ACT_BIN_SECONDS,
+            "effort_mode": "uniform",
+            "note": (
+                "Parallel cameras run continuously, so detection times need "
+                "no effort correction. Curves are kernel-smoothed half-hour "
+                "histograms of camera-local clock time, scaled so each "
+                "integrates to 1 over the 24-hour cycle."
+            ),
+        },
+    }
+
+    progress = {
+        "n_sequences_total": int(n_seq_total),
+        "n_sequences_human_reviewed": n_reviewed,
+        "pct_human_reviewed": round(100 * n_reviewed / n_seq_total, 2),
+        "n_sequences_ahdrift_in_export": n_ahdrift_rows,
+        "n_images_uploaded": sum(count_lines(p)
+                                 for p in sorted(WI_DIR.glob("images_*.csv"))),
+        # Reviewer identities are deliberately not published: per-person
+        # sequence counts are individual productivity data, not a result.
+        "n_reviewers": len(reviewers),
+        "n_ct_deployment_rows_raw": n_dep_raw,
+        "n_ct_deployment_rows_used": len(effort_rows),
+        "note": (
+            "Sequences are the Wildlife Insights identification unit. The "
+            "export's AHDriFT rows are no longer used for the bucket-camera "
+            "view: those identifications are superseded by the cleaned "
+            "AHDriFT table, which also records the plot-days that produced "
+            "no detection."
+        ),
+    }
+    site_payload = {k: {**v, "days": round(d, 1)}
+                    for k, (v, d) in ((k, (site_meta[k], site_days[k]))
+                                      for k in site_days)}
+    return payload, effort_rows, dict(point_counts), {"sites": site_payload,
+                                                      "progress": progress}
+
+
+# --------------------------------------------------------------------------
+# 3. BirdNET -- per-species confidence cutoffs from manual validation
+# --------------------------------------------------------------------------
+# Every species label in the BirdNET output has a row in BirdNet_Thresholds.csv.
+# Four states exist in that file, and they are not interchangeable, so each
+# becomes its own group on the dashboard rather than being averaged together.
+BN_GROUPS = [
+    ("validated", "Validated birds",
+     "Cutoff applied",
+     "150 clips were reviewed per species and the confidence at which 95% of "
+     "detections are true positives was recorded. Only detections at or above "
+     "that species-specific cutoff are shown."),
+    ("no_cutoff", "Birds with no attainable cutoff",
+     "Cutoff not found",
+     "Listening found no confidence at which 95% of detections were true "
+     "positives, so these species carry a nominal threshold of 1.0. No "
+     "filtered count can be published for them; the raw detections are shown "
+     "and must not be treated as occurrences."),
+    ("frogs", "Frogs and toads",
+     "Not yet validated",
+     "Anuran detections have not been validated, so no cutoff exists and no "
+     "filter is applied. These are raw classifier hits at the 0.2 confidence "
+     "floor and the false-positive rate is unknown."),
+    ("pending", "Birds awaiting validation",
+     "Not yet validated",
+     "These species are in the validation queue but have not been reviewed "
+     "yet, so no cutoff exists and no filter is applied."),
+    ("other", "Anthropogenic and domestic labels",
+     "Not wildlife",
+     "Engine, gunshot, human and domestic-dog labels. Kept visible because "
+     "they are a real part of the soundscape and a known source of "
+     "false positives in the bird classes, but excluded from every species "
+     "and activity figure."),
+]
+
+
+def load_thresholds() -> dict:
+    """species label -> {group, threshold, validation tallies}."""
+    th = pd.read_csv(TH_CSV)
+    th.columns = [c.strip() for c in th.columns]
+    out = {}
+    for _, r in th.iterrows():
+        name = str(r["Common Name"]).strip()
+        if not name:
+            continue
+        klass = str(r.get("class") or "").strip()
+        cut = pd.to_numeric(pd.Series([r.get("Threshold")]),
+                            errors="coerce").iloc[0]
+        done = str(r.get("Completed") or "").strip().upper()
+        pos = pd.to_numeric(pd.Series([r.get("Positive")]),
+                            errors="coerce").fillna(0).iloc[0]
+        neg = pd.to_numeric(pd.Series([r.get("Negative")]),
+                            errors="coerce").fillna(0).iloc[0]
+        skip = pd.to_numeric(pd.Series([r.get("Skipped")]),
+                             errors="coerce").fillna(0).iloc[0]
+
+        if klass == "Anthropogenic" or name == "Dog":
+            group = "other"
+        elif pd.notna(cut) and cut >= 1.0:
+            group = "no_cutoff"
+        elif pd.notna(cut):
+            group = "validated"
+        elif klass == "Amphibia":
+            group = "frogs"
+        else:
+            group = "pending"
+
+        notes = r.get("Other notes")
+        out[name] = {
+            "group": group,
+            "threshold": (round(float(cut), 3)
+                          if pd.notna(cut) and cut < 1.0 else None),
+            "class_in_log": klass or None,
+            "completed": done or None,
+            "n_listened": int(pos + neg + skip),
+            "n_positive": int(pos),
+            "n_negative": int(neg),
+            "n_skipped": int(skip),
+            "reviewer_note": (str(notes).strip()
+                              if isinstance(notes, str) and notes.strip()
+                              else None),
+        }
+    return out
+
+
+def build_birdnet() -> dict:
+    """Species tallies, validation groups and activity curves from BirdNET.
+
+    One streaming pass over the 777 MB detection table collects, per species,
+    raw and retained counts, plot and plot-type tallies and a half-hour
+    activity histogram, and in parallel collects one record per recording file
+    so that recording effort per half-hour can be reconstructed.
+
+    The effort reconstruction matters more here than anywhere else on the
+    dashboard. ARU effort is NOT uniform across the day: the schedule runs
+    roughly 1,800 five-minute recordings per hour through the night and a
+    60-minute recording over the dawn chorus, but only about 65 recordings in
+    total across the whole season for each midday hour. A raw histogram of
+    detection times would therefore show a dawn spike and an empty afternoon
+    that are largely artefacts of when the recorders were switched on, so the
+    published activity figure is detections per recording-hour.
+    """
+    thresholds = load_thresholds()
+
+    sp_raw = Counter()
+    sp_ret = Counter()
+    sp_meta = {}
+    sp_plots = defaultdict(set)
+    sp_plot_type = defaultdict(Counter)
+    sp_plot = defaultdict(Counter)
+    sp_act = defaultdict(lambda: defaultdict(empty_bins))
+    conf_hist = Counter()            # 0.05-wide confidence bins, all species
+    plot_dates = defaultdict(set)
+    plot_type_of_plot = {}
+    file_max = {}
+    file_meta = {}
+    n_rows = 0
+    unlisted = Counter()
+
+    usecols = ["Plot", "Plot.Type", "Date", "Rec.Hour", "Rec.Min", "Start.sec",
+               "End.sec", "Species", "Confidence", "Latin.Name", "class",
+               "order", "File"]
+    for chunk in pd.read_csv(BN_CSV, usecols=usecols, chunksize=750_000,
+                             low_memory=False):
+        n_rows += len(chunk)
+        chunk = chunk.dropna(subset=["Species"]).copy()
+        chunk["Species"] = chunk["Species"].astype(str).str.strip()
+        chunk["conf"] = pd.to_numeric(chunk["Confidence"],
+                                      errors="coerce").fillna(0.0)
+        chunk["pt"] = chunk["Plot.Type"].map(
+            lambda c: PLOT_TYPES.get(str(c).strip(), str(c).strip()))
+
+        # recording-file inventory for the effort denominator
+        fg = chunk.groupby("File").agg(mx=("End.sec", "max"),
+                                       h=("Rec.Hour", "first"),
+                                       m=("Rec.Min", "first"),
+                                       pt=("pt", "first"),
+                                       plot=("Plot", "first"),
+                                       date=("Date", "first"))
+        for fname, r in fg.iterrows():
+            prev = file_max.get(fname)
+            mx = float(r["mx"]) if pd.notna(r["mx"]) else 0.0
+            file_max[fname] = mx if prev is None else max(prev, mx)
+            if fname not in file_meta:
+                file_meta[fname] = (
+                    int(r["h"]) if pd.notna(r["h"]) else 0,
+                    int(r["m"]) if pd.notna(r["m"]) else 0,
+                    r["pt"], str(r["plot"]), str(r["date"]))
+
+        for sp, g in chunk.groupby("Species"):
+            info = thresholds.get(sp)
+            if info is None:
+                unlisted[sp] += len(g)
+                continue
+            sp_raw[sp] += len(g)
+            if sp not in sp_meta:
+                latin = g["Latin.Name"].dropna()
+                klass = g["class"].dropna()
+                order = g["order"].dropna()
+                sp_meta[sp] = {
+                    "latin_name": str(latin.iloc[0]) if len(latin) else None,
+                    "class": str(klass.iloc[0]) if len(klass) else None,
+                    "order": str(order.iloc[0]) if len(order) else None,
+                }
+            cut = info["threshold"]
+            keep = g if cut is None else g.loc[g["conf"] >= cut]
+            if not len(keep):
+                continue
+            sp_ret[sp] += len(keep)
+            sp_plots[sp].update(keep["Plot"].dropna().astype(str))
+            for pt, n in keep["pt"].value_counts().items():
+                sp_plot_type[sp][str(pt)] += int(n)
+            for p, n in keep["Plot"].value_counts().items():
+                sp_plot[sp][str(p)] += int(n)
+            if info["group"] != "other":
+                bins = ((pd.to_numeric(keep["Rec.Hour"], errors="coerce")
+                         .fillna(0) * 3600
+                         + pd.to_numeric(keep["Rec.Min"], errors="coerce")
+                         .fillna(0) * 60
+                         + pd.to_numeric(keep["Start.sec"], errors="coerce")
+                         .fillna(0)) % 86400 // ACT_BIN_SECONDS).astype(int)
+                for (pt, b), n in keep.assign(_b=bins).groupby(
+                        ["pt", "_b"]).size().items():
+                    sp_act[sp][str(pt)][int(b)] += int(n)
+
+        conf_hist.update((chunk["conf"] // 0.05).astype(int)
+                         .value_counts().to_dict())
+        for (plot, pt), g in chunk.groupby(["Plot", "pt"]):
+            plot_dates[str(plot)].update(g["Date"].dropna().astype(str))
+            plot_type_of_plot[str(plot)] = str(pt)
+
+    # ---- recording effort per half-hour bin, per plot type ----------------
+    effort = defaultdict(lambda: [0] * ACT_BINS)
+    file_count = defaultdict(int)
+    n_long = 0
+    for fname, mx in file_max.items():
+        h, m, pt, _plot, _date = file_meta[fname]
+        dur = ARU_LONG_SECONDS if mx > ARU_DURATION_SPLIT else ARU_SHORT_SECONDS
+        n_long += dur == ARU_LONG_SECONDS
+        file_count[pt] += 1
+        t = (h * 3600 + m * 60) % 86400
+        left = dur
+        while left > 0:
+            b = int(t // ACT_BIN_SECONDS)
+            room = (b + 1) * ACT_BIN_SECONDS - t
+            take = min(left, room)
+            effort[pt][b] += take
+            t = (t + take) % 86400
+            left -= take
+    effort_hours = {pt: [round(s / 3600.0, 3) for s in arr]
+                    for pt, arr in effort.items()}
+    total_rec_hours = sum(sum(a) for a in effort_hours.values())
+
+    # ---- per-species rows -------------------------------------------------
+    species = []
+    for sp, raw in sp_raw.most_common():
+        info = thresholds[sp]
+        meta = sp_meta.get(sp, {})
+        ret = int(sp_ret.get(sp, 0))
+        n_listened = info["n_listened"]
+        species.append({
+            "species": sp,
+            "latin_name": meta.get("latin_name"),
+            "class": meta.get("class") or info["class_in_log"],
+            "order": meta.get("order"),
+            "group": info["group"],
+            "threshold": info["threshold"],
+            "filtered": info["threshold"] is not None,
+            "n_detections_raw": int(raw),
+            "n_detections": ret,
+            "pct_retained": (round(100 * ret / raw, 1) if raw else None),
+            "n_plots": len(sp_plots[sp]),
+            "by_plot_type": {k: int(v) for k, v in sp_plot_type[sp].items()},
+            "by_plot": {k: int(v) for k, v in sorted(sp_plot[sp].items())},
+            "activity": pack_activity(sp_act[sp]) if sp in sp_act else {},
+            "validation": {
+                "n_listened": n_listened,
+                "n_positive": info["n_positive"],
+                "n_negative": info["n_negative"],
+                "n_skipped": info["n_skipped"],
+                "completed": info["completed"],
+                # The share of listened clips that were genuinely the species.
+                # This is the outcome of a stratified listening exercise, not
+                # the precision of the dataset, and is labelled as such
+                # wherever it is displayed.
+                "sample_positive_rate": (
+                    round(info["n_positive"] / n_listened, 3)
+                    if n_listened else None),
+                "note": info["reviewer_note"],
+            },
+        })
+
+    groups = []
+    for gid, label, status, note in BN_GROUPS:
+        rows = [s for s in species if s["group"] == gid]
+        groups.append({
+            "id": gid,
+            "label": label,
+            "status": status,
+            "note": note,
+            "n_species": len(rows),
+            "n_detections_raw": sum(s["n_detections_raw"] for s in rows),
+            "n_detections": sum(s["n_detections"] for s in rows),
+            "filtered": gid == "validated",
+            "classes": sorted({s["class"] for s in rows if s["class"]},
+                              key=class_rank),
+        })
+
+    dates = sorted({d for ds in plot_dates.values() for d in ds})
+    plots = [{"plot": p,
+              "plot_type": plot_type_of_plot.get(p),
+              "n_recording_days": len(plot_dates[p]),
+              "first_date": min(plot_dates[p]),
+              "last_date": max(plot_dates[p])}
+             for p in sorted(plot_dates)]
+
+    wildlife = [s for s in species if s["group"] != "other"]
+    val = [s for s in species if s["group"] == "validated"]
+    listened_total = sum(s["validation"]["n_listened"] for s in species)
+    cuts = sorted(s["threshold"] for s in val if s["threshold"] is not None)
+
+    point_counts = defaultdict(Counter)
+    for s in wildlife:
+        for p, n in s["by_plot"].items():
+            point_counts[p][s["species"]] += int(n)
+
+    payload = {
+        "source": "data/Bird_Frog_Audio_Summaries/preliminary_BirdNET_Results.csv",
+        "unit": "classifier detections",
+        "note": (
+            "BirdNET detections are classifier hits on 3-second windows, not "
+            "verified occurrences. Bird species that have been validated are "
+            "filtered to their own 95% confidence cutoff; every other group "
+            "is raw and unfiltered. Counts are not corrected for recording "
+            "effort, which differs among plots and, far more sharply, among "
+            "hours of the day -- see the activity panel."
+        ),
+        "plot_label_note": (
+            "Bird/frog ARUs at turbine plots are logged under the turbine "
+            "code: each unit sits at the edge of the opening with the "
+            "microphone aimed inward, sampling both the opening and the "
+            "adjacent forest."
+        ),
+        "n_detections_total": int(n_rows),
+        "n_detections_raw": int(sum(sp_raw.values())),
+        "n_detections_retained": int(sum(sp_ret.values())),
+        "n_species_total": len(species),
+        "n_wildlife_species": len(wildlife),
+        "confidence_floor": round(min(b * 0.05 for b in conf_hist), 2),
+        "confidence_histogram": [{"lower": round(b * 0.05, 2), "n": int(n)}
+                                 for b, n in sorted(conf_hist.items())],
+        "labels_not_in_threshold_file": [{"species": k, "n": int(v)}
+                                         for k, v in unlisted.most_common()],
+        "groups": groups,
+        "group_order": [g[0] for g in BN_GROUPS],
+        "recording_window": {"first_date": dates[0] if dates else None,
+                             "last_date": dates[-1] if dates else None,
+                             "n_dates": len(dates)},
+        "n_plots": len(plots),
+        "plots": plots,
+        "by_class": [
+            {"class": k, "label": CLASS_LABELS.get(k, k),
+             "n_species": sum(1 for s in wildlife if s["class"] == k),
+             "n_detections": sum(s["n_detections"] for s in wildlife
+                                 if s["class"] == k)}
+            for k in sorted({s["class"] for s in wildlife if s["class"]},
+                            key=class_rank)
+        ],
+        "activity": {
+            "bins": ACT_BINS,
+            "bin_seconds": ACT_BIN_SECONDS,
+            "effort_mode": "per_bin_hours",
+            "effort_hours": effort_hours,
+            "n_recordings": {k: int(v) for k, v in file_count.items()},
+            "n_recordings_total": len(file_max),
+            "n_recordings_long": int(n_long),
+            "total_recording_hours": round(total_rec_hours, 1),
+            "note": (
+                "Recording effort is strongly uneven across the day: the "
+                "schedule takes short recordings through the night, a long "
+                "recording over the dawn chorus, and very few recordings at "
+                f"all in the middle of the day. All {len(file_max):,} "
+                "recordings were therefore reduced to recorded hours per "
+                "half-hour of the clock, and the curves plot detections per "
+                "recording-hour, not raw detections. Each curve is scaled to "
+                "integrate to 1 over the 24-hour cycle so plot types are "
+                "comparable in shape. Bins with no recording effort carry no "
+                "curve."
+            ),
+            "duration_note": (
+                "Recording length is inferred per file from the largest "
+                "detection offset it contains: the two scheduled lengths "
+                f"({ARU_SHORT_SECONDS} s and {ARU_LONG_SECONDS} s) separate "
+                "cleanly, with no file in the dataset having a maximum offset "
+                f"between {ARU_SHORT_SECONDS} and {ARU_DURATION_SPLIT} s. A "
+                "long recording whose only detections fell in its first few "
+                "minutes would be scored short, which would slightly "
+                "under-state effort in the affected bin."
+            ),
+        },
+        "validation": {
+            "design": "listen_150_per_species_then_fixed_cutoff",
+            "target_p": 0.95,
+            "n_listened_per_species": 150,
+            "n_species_in_log": len(thresholds),
+            "n_species_validated": len(val),
+            "n_species_no_cutoff": sum(1 for s in species
+                                       if s["group"] == "no_cutoff"),
+            "n_species_pending": sum(1 for s in species
+                                     if s["group"] == "pending"),
+            "n_species_frogs": sum(1 for s in species
+                                   if s["group"] == "frogs"),
+            "n_clips_listened": listened_total,
+            "n_clips_positive": sum(s["validation"]["n_positive"]
+                                    for s in species),
+            "n_clips_negative": sum(s["validation"]["n_negative"]
+                                    for s in species),
+            "n_clips_skipped": sum(s["validation"]["n_skipped"]
+                                   for s in species),
+            "cutoff_min": cuts[0] if cuts else None,
+            "cutoff_median": (cuts[len(cuts) // 2] if cuts else None),
+            "cutoff_max": cuts[-1] if cuts else None,
+            "cutoff_at_floor": sum(1 for c in cuts if c <= 0.25),
+            "n_detections_validated_raw": sum(s["n_detections_raw"]
+                                              for s in val),
+            "n_detections_validated_retained": sum(s["n_detections"]
+                                                   for s in val),
+            "pct_retained_validated": (
+                round(100 * sum(s["n_detections"] for s in val)
+                      / max(sum(s["n_detections_raw"] for s in val), 1), 1)),
+            "note": (
+                "For each species, 150 detections were reviewed by ear and "
+                "the lowest confidence at which 95% of detections were true "
+                "positives was recorded as that species' cutoff. The "
+                "dashboard applies each cutoff to its own species. Five "
+                "species never reached 95% at any confidence and carry a "
+                "nominal 1.0 instead of a usable cutoff; anurans and the "
+                "remaining birds have not been reviewed yet and are shown "
+                "unfiltered."
+            ),
+            "sampling_note": (
+                "The share of listened clips that were true positives "
+                "describes the clips that were listened to, not the dataset: "
+                "clips were drawn to pin down each species' cutoff, not as a "
+                "random sample of its detections. Read it as validation "
+                "effort, never as the precision of the published counts."
+            ),
+        },
+        "species": species,
+    }
+    return payload, dict(point_counts)
+
+
+# --------------------------------------------------------------------------
+# 4. Locations, with per-point species tallies for the map popups
+# --------------------------------------------------------------------------
+def load_locations() -> pd.DataFrame:
+    df = pd.read_csv(LOC_CSV)
     df["plot_type"] = df["Plot_Type"].map(canon_plot_type)
     df["plot"] = df["Point_Name"].map(plot_code)
     df["sensor_type"] = df["Point_type"].astype(str).str.strip()
     df["key"] = df["Point_Name"].map(norm_key)
+    return df
+
+
+def build_locations(df: pd.DataFrame, ah_counts: dict, ct_counts: dict,
+                    aru_counts: dict, ah_effort: list, ct_sites: dict,
+                    bn_plots: list) -> dict:
+    """Published coordinates plus, per point, the species detected there.
+
+    The three sensor streams resolve to different spatial units and the popup
+    must not pretend otherwise. Parallel-camera sequences are attributed to
+    the individual camera station. The cleaned AHDriFT table and the BirdNET
+    output are both recorded at the plot, so their popups are labelled as
+    plot totals -- there is exactly one AHDriFT array and one ARU per plot,
+    so no information is lost, but the label still says which unit it is.
+    """
+    ah_days = {r["plot"]: r for r in ah_effort}
+    bn_day = {p["plot"]: p for p in bn_plots}
+
+    def listify(counter):
+        """Species tally for one point, every species, largest first.
+
+        Not truncated. An ARU plot carries sixty-odd species and the whole
+        point of the popup is to be able to read what was recorded there, so
+        the published list is complete and the frontend decides how much of it
+        to show on hover versus on click. The cost is about 60 KB of JSON.
+        """
+        items = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+        return [{"name": k, "n": int(v)} for k, v in items]
 
     points = []
     displacements = []
     for _, r in df.iterrows():
         lat0, lon0 = float(r["y"]), float(r["x"])
-        jlat, jlon = jitter(str(r["Point_Name"]), lat0, lon0)
-        # Measure what was actually published so the note states the real
-        # range. Rounding to COORD_DECIMALS adds up to ~78 m on top of the
-        # drawn offset, so the effective maximum exceeds JITTER_MAX_M.
+        pid = str(r["Point_Name"])
+        jlat, jlon = jitter(pid, lat0, lon0)
         displacements.append(math.hypot(
             (jlat - lat0) * 111_320.0,
             (jlon - lon0) * 111_320.0 * math.cos(math.radians(lat0))))
-        points.append({
-            "id": str(r["Point_Name"]),
+
+        entry = {
+            "id": pid,
             "plot": r["plot"],
             "plot_type": r["plot_type"],
             "sensor_type": r["sensor_type"],
             "lat": jlat,
             "lon": jlon,
-        })
+        }
+        if r["sensor_type"] == "AHDriFT" and r["plot"] in ah_counts:
+            c = ah_counts[r["plot"]]
+            eff = ah_days.get(r["plot"], {})
+            entry["detections"] = {
+                "bucket_camera": {
+                    "scope": "plot",
+                    "scope_label": f"AHDriFT array at plot {r['plot']}",
+                    "unit": "detection events",
+                    "effort": (f"{eff.get('days', 0)} array-days, "
+                               f"{eff.get('hut_days', 0)} hut-days"),
+                    "n_detections": int(sum(c.values())),
+                    "n_species": len(c),
+                    "species": listify(c),
+                }
+            }
+        if r["sensor_type"] != "AHDriFT" and r["key"] in ct_counts:
+            c = ct_counts[r["key"]]
+            site = ct_sites.get(r["key"], {})
+            entry["detections"] = {
+                "parallel_camera": {
+                    "scope": "station",
+                    "scope_label": f"Camera station {pid}",
+                    "unit": "sequences",
+                    "effort": (f"{site.get('days', 0)} camera-days"
+                               if site else None),
+                    "n_detections": int(sum(c.values())),
+                    "n_species": len(c),
+                    "species": listify(c),
+                }
+            }
+        if r["sensor_type"] == "AHDriFT" and r["plot"] in aru_counts:
+            c = aru_counts[r["plot"]]
+            day = bn_day.get(r["plot"], {})
+            entry.setdefault("detections", {})["bird_frog_audio"] = {
+                "scope": "plot",
+                "scope_label": f"ARU at plot {r['plot']}",
+                "unit": "detections after validation filtering",
+                "effort": (f"{day.get('n_recording_days', 0)} recording days"
+                           if day else None),
+                "n_detections": int(sum(c.values())),
+                "n_species": len(c),
+                "species": listify(c),
+            }
+        points.append(entry)
 
-    by_type = (df.groupby(["plot_type", "sensor_type"]).size()
-                 .reset_index(name="n"))
     d_lo, d_hi = min(displacements), max(displacements)
     d_med = sorted(displacements)[len(displacements) // 2]
-    payload = {
+    return {
         "precision_note": (
             f"Coordinates are deliberately obfuscated: each point is "
             f"displaced along a fixed pseudo-random bearing and rounded to "
@@ -372,113 +1308,72 @@ def build_locations() -> tuple[dict, pd.DataFrame]:
                            "max": round(d_hi, 1)},
         "jitter_min_m": JITTER_MIN_M,
         "jitter_max_m": JITTER_MAX_M,
+        "popup_note": (
+            "Hovering a marker lists every species recorded by that sensor "
+            "and how many times. Parallel-camera tallies belong to the "
+            "individual camera station; AHDriFT and ARU tallies belong to the "
+            "plot, which carries one array and one recorder respectively."
+        ),
         "n_points": len(points),
         "n_plots": int(df["plot"].nunique()),
         "counts": [
             {"plot_type": r.plot_type, "sensor_type": r.sensor_type,
              "n": int(r.n)}
-            for r in by_type.itertuples()
+            for r in (df.groupby(["plot_type", "sensor_type"]).size()
+                        .reset_index(name="n").itertuples())
         ],
         "points": points,
     }
-    return payload, df
 
 
 # --------------------------------------------------------------------------
-# 2. Effort (deployment durations)
+# 5. Effort
 # --------------------------------------------------------------------------
-def build_effort(loc: pd.DataFrame) -> dict:
-    dep = pd.read_csv(WI_DIR / "deployments.csv")
-    dep["key"] = dep["placename"].map(norm_key)
-    dep["plot"] = dep["placename"].map(plot_code)
-    dep["plot_type"] = dep["placename"].map(plot_type_of)
-
-    # Prefer the sensor type implied by the placename; fall back to the
-    # Wildlife Insights subproject name.
-    dep["sensor_type"] = dep["placename"].map(sensor_type_of)
-    sub = dep["subproject_name"].fillna("")
-    dep.loc[dep["sensor_type"].isna() & sub.str.contains("AHDriFT"),
-            "sensor_type"] = "AHDriFT"
-    dep.loc[dep["sensor_type"].isna() & sub.str.contains("Camera_Traps"),
-            "sensor_type"] = "Camera Trap"
-
-    # Fill missing plot type from the location table where possible.
-    lut = dict(zip(loc["key"], loc["plot_type"]))
-    dep["plot_type"] = dep["plot_type"].fillna(dep["key"].map(lut))
-
-    dep["start"] = pd.to_datetime(dep["start_date"], errors="coerce")
-    dep["end"] = pd.to_datetime(dep["end_date"], errors="coerce")
-    dep["days"] = (dep["end"] - dep["start"]).dt.total_seconds() / 86400.0
-
-    n_total = len(dep)
-    bad = dep["days"].isna() | (dep["days"] <= 0) | dep["plot_type"].isna()
-    dep = dep.loc[~bad].copy()
-
-    # AHDriFT deployments are recorded twice per array (motion capture "MC" and
-    # time-lapse "TL" schedules on the same physical camera). Effort is the
-    # union of the two, so collapse to one row per camera per date window.
-    dep["camera_slot"] = (dep["deployment_id"].astype(str)
-                          .str.extract(r"(Cam[A-Z])", expand=False)
-                          .fillna("CamA"))
-    dep["unit"] = dep["plot"].astype(str) + "|" + dep["camera_slot"]
-
-    records = []
-    for view, sensor in (("bucket_camera", "AHDriFT"),
-                         ("parallel_camera", "Camera Trap")):
-        d = dep.loc[dep["sensor_type"] == sensor]
-        if sensor == "AHDriFT":
-            d = (d.sort_values("days", ascending=False)
-                  .drop_duplicates(subset=["unit", "start", "end"]))
-        for r in d.itertuples():
-            records.append({
-                "view": view,
-                "deployment_id": str(r.deployment_id),
-                "plot": r.plot,
-                "plot_type": r.plot_type,
-                "sensor_type": sensor,
-                "start": r.start.strftime("%Y-%m-%d"),
-                "end": r.end.strftime("%Y-%m-%d"),
-                "days": round(float(r.days), 1),
-                "functioning": (str(r.camera_functioning)
-                                if pd.notna(r.camera_functioning) else None),
-            })
-
-    # Bird/frog ARU effort comes from the BirdNET recording dates, since ARU
-    # deployments are not tracked in Wildlife Insights.
+def build_effort(ah_rows: list, ct_rows: list, ahdrift: dict,
+                 parallel: dict) -> dict:
+    records = ah_rows + ct_rows
     summary = {}
-    for view in ("bucket_camera", "parallel_camera"):
-        rs = [r for r in records if r["view"] == view]
+    for view, rows in (("bucket_camera", ah_rows),
+                       ("parallel_camera", ct_rows)):
         per_type = defaultdict(lambda: {"n": 0, "days": 0.0})
-        for r in rs:
+        for r in rows:
             per_type[r["plot_type"]]["n"] += 1
             per_type[r["plot_type"]]["days"] += r["days"]
-        days = sorted(r["days"] for r in rs)
+        days = sorted(r["days"] for r in rows)
         summary[view] = {
-            "n_deployments": len(rs),
+            "n_deployments": len(rows),
             "total_sensor_days": round(sum(days), 1),
             "mean_days": round(sum(days) / len(days), 1) if days else 0,
             "median_days": round(days[len(days) // 2], 1) if days else 0,
             "min_days": round(days[0], 1) if days else 0,
             "max_days": round(days[-1], 1) if days else 0,
+            "unit_label": ("AHDriFT array (one per plot)"
+                           if view == "bucket_camera"
+                           else "camera deployment"),
             "by_plot_type": [
                 {"plot_type": k, "n_deployments": v["n"],
                  "sensor_days": round(v["days"], 1)}
-                for k, v in sorted(per_type.items(),
-                                   key=lambda kv: PLOT_TYPE_ORDER.index(kv[0])
-                                   if kv[0] in PLOT_TYPE_ORDER else 99)
+                for k, v in sorted(
+                    per_type.items(),
+                    key=lambda kv: (PLOT_TYPE_ORDER.index(kv[0])
+                                    if kv[0] in PLOT_TYPE_ORDER else 99))
             ],
-            "functioning": dict(Counter(
-                r["functioning"] or "Unknown" for r in rs)),
+            "functioning": dict(Counter(r["functioning"] or "Unknown"
+                                        for r in rows)),
         }
+    summary["bucket_camera"]["total_hut_days"] = sum(
+        r.get("hut_days", 0) for r in ah_rows)
 
     return {
         "note": (
-            "One bar per camera deployment (a camera at one point over one "
-            "date window). AHDriFT arrays log a motion-capture and a "
-            "time-lapse schedule for the same physical camera; these are "
-            "collapsed so effort is not double counted."
+            "Bucket-camera effort is one bar per AHDriFT array -- the plot-"
+            "days actually reviewed in the cleaned detection table, which is "
+            "the same denominator the detection rates use. Parallel-camera "
+            "effort is one bar per deployment (a camera at one station over "
+            "one date window). The two are not comparable units and are "
+            "never summed."
         ),
-        "n_deployment_rows_raw": n_total,
+        "n_deployment_rows_raw": len(records),
         "n_deployment_rows_used": len(records),
         "summary": summary,
         "deployments": records,
@@ -486,581 +1381,214 @@ def build_effort(loc: pd.DataFrame) -> dict:
 
 
 # --------------------------------------------------------------------------
-# 3. Camera species (Wildlife Insights sequences)
-# --------------------------------------------------------------------------
-def build_camera_species() -> tuple[dict, dict, dict]:
-    cols = ["deployment_id", "sequence_id", "is_blank", "identified_by",
-            "class", "order", "family", "genus", "species", "common_name",
-            "group_size"]
-    seq = pd.read_csv(WI_DIR / "sequences.csv", usecols=cols,
-                      low_memory=False)
-    n_seq_total = len(seq)
-
-    ident = seq["identified_by"].fillna("")
-    seq["human_reviewed"] = (ident != "") & (ident != "Computer vision")
-    seq["plot"] = seq["deployment_id"].map(plot_code)
-    seq["plot_type"] = seq["deployment_id"].map(plot_type_of)
-    seq["sensor_type"] = seq["deployment_id"].map(sensor_type_of)
-
-    reviewers = Counter(x for x in ident if x and x != "Computer vision")
-    n_reviewed = int(seq["human_reviewed"].sum())
-
-    hum = seq.loc[seq["human_reviewed"]].copy()
-    hum["latin"] = (hum["genus"].fillna("").astype(str).str.strip() + " " +
-                    hum["species"].fillna("").astype(str).str.strip()
-                    ).str.strip()
-
-    views = {}
-    for view, sensor in (("bucket_camera", "AHDriFT"),
-                         ("parallel_camera", "Camera Trap")):
-        d = hum.loc[hum["sensor_type"] == sensor].copy()
-        keep = d["common_name"].map(is_species_label)
-        sp = d.loc[keep]
-        coarse = d.loc[~keep & d["common_name"].notna()]
-
-        rows = []
-        for name, g in sp.groupby("common_name"):
-            per_type = Counter(g["plot_type"].dropna())
-            latin = next((x for x in g["latin"] if x), None)
-            klass = next((x for x in g["class"].dropna() if x), None)
-            rows.append({
-                "common_name": str(name),
-                "latin_name": latin or None,
-                "class": str(klass) if klass else None,
-                "order": (str(g["order"].dropna().iloc[0])
-                          if g["order"].notna().any() else None),
-                "n_sequences": int(len(g)),
-                "n_plots": int(g["plot"].nunique()),
-                "by_plot_type": {k: int(v) for k, v in per_type.items()},
-            })
-        rows.sort(key=lambda r: -r["n_sequences"])
-
-        by_class = Counter(r["class"] or "Unclassified" for r in rows)
-        views[view] = {
-            "n_species": len(rows),
-            "n_identified_sequences": int(len(sp)),
-            "n_coarse_sequences": int(len(coarse)),
-            "coarse_note": (
-                "Detections identified only to a coarse group (e.g. 'Rodent', "
-                "'Insect') or to a non-wildlife label are counted here and "
-                "excluded from the species chart."
-            ),
-            "by_class": [{"class": k, "n_species": int(v)}
-                         for k, v in sorted(by_class.items(),
-                                            key=lambda kv: -kv[1])],
-            "by_plot_type": [
-                {"plot_type": pt,
-                 "n_sequences": int((sp["plot_type"] == pt).sum()),
-                 "n_species": int(sp.loc[sp["plot_type"] == pt,
-                                         "common_name"].nunique())}
-                for pt in PLOT_TYPE_ORDER
-            ],
-            "species": rows,
-        }
-
-    n_images = sum(count_lines(p)
-                   for p in sorted(WI_DIR.glob("images_*.csv")))
-    progress = {
-        "n_sequences_total": int(n_seq_total),
-        "n_sequences_human_reviewed": n_reviewed,
-        "pct_human_reviewed": round(100 * n_reviewed / n_seq_total, 2),
-        "n_images_uploaded": n_images,
-        # Reviewer identities are deliberately NOT published: per-person
-        # sequence counts are individual productivity data, not a study result.
-        # Only the team size is reported.
-        "n_reviewers": len(reviewers),
-        "note": (
-            "Sequences are the Wildlife Insights identification unit. The "
-            "remainder carry computer-vision output (MegaDetector) awaiting "
-            "expert review; vehicle and blank sequences are filtered out of "
-            "the species tallies."
-        ),
-    }
-    return views["bucket_camera"], views["parallel_camera"], progress
-
-
-# --------------------------------------------------------------------------
-# 4. BirdNET + validation progress
-# --------------------------------------------------------------------------
-def build_birdnet() -> dict:
-    src = RAW / "Bird_Frog_Audio_Summaries" / "preliminary_BirdNET_Results.csv"
-
-    sp_tot = Counter()
-    sp_thresh = {t: Counter() for t in BIRDNET_THRESHOLDS}
-    # species -> stratum index -> n detections, for the validation design and
-    # for counting how many positives a fitted cutoff would retain.
-    sp_bins = defaultdict(Counter)
-    sp_meta = {}
-    sp_plots = defaultdict(set)
-    sp_plot_type = defaultdict(Counter)
-    plot_dates = defaultdict(set)
-    plot_type_of_plot = {}
-    hour_hist = defaultdict(Counter)   # class -> hour -> n
-    n_rows = 0
-
-    usecols = ["Plot", "Plot.Type", "Date", "Rec.Hour", "Species",
-               "Confidence", "Latin.Name", "class", "order"]
-    for chunk in pd.read_csv(src, usecols=usecols, chunksize=400_000,
-                             low_memory=False):
-        n_rows += len(chunk)
-        chunk = chunk.dropna(subset=["Species"])
-        conf = pd.to_numeric(chunk["Confidence"], errors="coerce").fillna(0)
-
-        for sp, n in chunk["Species"].value_counts().items():
-            sp_tot[sp] += int(n)
-        for t in BIRDNET_THRESHOLDS:
-            sub = chunk.loc[conf >= t, "Species"]
-            for sp, n in sub.value_counts().items():
-                sp_thresh[t][sp] += int(n)
-
-        # Stratum tallies for the validation design.
-        strata = conf.map(bin_index)
-        keep = strata >= 0
-        if keep.any():
-            grouped = (chunk.loc[keep, "Species"]
-                       .groupby([chunk.loc[keep, "Species"],
-                                 strata.loc[keep]]).size())
-            for (sp, b), n in grouped.items():
-                sp_bins[sp][int(b)] += int(n)
-
-        for sp, g in chunk.groupby("Species"):
-            if sp not in sp_meta:
-                latin = g["Latin.Name"].dropna()
-                klass = g["class"].dropna()
-                order = g["order"].dropna()
-                sp_meta[sp] = {
-                    "latin_name": str(latin.iloc[0]) if len(latin) else None,
-                    "class": str(klass.iloc[0]) if len(klass) else None,
-                    "order": str(order.iloc[0]) if len(order) else None,
-                }
-            sp_plots[sp].update(g["Plot"].dropna().astype(str))
-            for pt, n in g["Plot.Type"].value_counts().items():
-                sp_plot_type[sp][str(pt)] += int(n)
-
-        for (plot, pt), g in chunk.groupby(["Plot", "Plot.Type"]):
-            plot_dates[str(plot)].update(g["Date"].dropna().astype(str))
-            plot_type_of_plot[str(plot)] = str(pt)
-
-        hr = pd.to_numeric(chunk["Rec.Hour"], errors="coerce")
-        for klass, g in chunk.assign(_h=hr).groupby("class"):
-            for h, n in g["_h"].dropna().astype(int).value_counts().items():
-                hour_hist[str(klass)][int(h)] += int(n)
-
-    # ---- validation log ----------------------------------------------------
-    # species -> confidence bin label -> {n_checked, n_true_positive}
-    val = defaultdict(dict)
-    if VALIDATION_LOG.exists():
-        with VALIDATION_LOG.open() as fh:
-            for row in csv.DictReader(fh):
-                name = (row.get("species") or "").strip()
-                cbin = (row.get("confidence_bin") or "").strip()
-                if not name or not cbin:
-                    continue
-                try:
-                    nc = int(float(row.get("n_checked") or 0))
-                    ntp = int(float(row.get("n_true_positive") or 0))
-                except ValueError:
-                    continue
-                if ntp > nc:
-                    log(f"WARNING: {name} [{cbin}] has more true positives "
-                        f"({ntp}) than checked ({nc}); check the log")
-                val[name][cbin] = {"n_checked": nc, "n_true_positive": ntp}
-
-    # Plot-type label mapping: bird/frog ARUs at turbine plots are recorded
-    # under the "TO" code (they sit at the opening edge, sampling both the
-    # opening and adjacent forest -- see TNC report Table 1 footnote).
-    def expand_pt(code: str) -> str:
-        return {"TO": "Turbine Opening", "IF": "Interior Forest",
-                "RE": "Reference Edge", "TE": "Turbine Edge"}.get(code, code)
-
-    n_bins = len(VALIDATION_BIN_EDGES) - 1
-    species = []
-    for sp, total in sp_tot.most_common():
-        meta = sp_meta.get(sp, {})
-        pool = sp_thresh[VALIDATION_POOL_THRESHOLD][sp]
-        bins = sp_bins.get(sp, Counter())
-        v = val.get(sp, {})
-
-        # Stratified allocation: spread VALIDATION_N_PER_SPECIES evenly over
-        # the strata that actually contain detections, so no effort is
-        # allocated to an empty confidence band. Remainders go to the
-        # highest-confidence occupied strata, where the cutoff usually sits.
-        occupied = [b for b in range(n_bins) if bins.get(b, 0) > 0]
-        alloc = {}
-        if occupied:
-            base, extra = divmod(min(VALIDATION_N_PER_SPECIES, pool),
-                                 len(occupied))
-            for b in occupied:
-                alloc[b] = min(base, bins[b])
-            for b in sorted(occupied, reverse=True)[:extra]:
-                if alloc[b] < bins[b]:
-                    alloc[b] += 1
-            # Redistribute any shortfall from strata too small to fill.
-            short = min(VALIDATION_N_PER_SPECIES, pool) - sum(alloc.values())
-            for b in sorted(occupied, key=lambda x: -bins[x]):
-                while short > 0 and alloc[b] < bins[b]:
-                    alloc[b] += 1
-                    short -= 1
-                if short <= 0:
-                    break
-
-        strata = []
-        fit_rows = []
-        done = tp = 0
-        for b in range(n_bins):
-            n_avail = int(bins.get(b, 0))
-            if n_avail == 0:
-                continue
-            key = bin_label(b)
-            rec = v.get(key, {})
-            nc = int(rec.get("n_checked", 0))
-            ntp = int(rec.get("n_true_positive", 0))
-            done += nc
-            tp += ntp
-            mid = (VALIDATION_BIN_EDGES[b] +
-                   min(VALIDATION_BIN_EDGES[b + 1], 1.0)) / 2.0
-            if nc > 0:
-                fit_rows.append((mid, nc, ntp))
-            strata.append({
-                "bin": key,
-                "midpoint": round(mid, 3),
-                "n_available": n_avail,
-                "target": int(alloc.get(b, 0)),
-                "n_checked": nc,
-                "n_true_positive": ntp,
-                "precision": round(ntp / nc, 3) if nc else None,
-            })
-
-        fit = fit_logistic_cutoff(fit_rows)
-        target_total = sum(alloc.values())
-
-        entry = {
-            "species": str(sp),
-            "latin_name": meta.get("latin_name"),
-            "class": meta.get("class"),
-            "order": meta.get("order"),
-            "n_detections": int(total),
-            "n_by_threshold": {str(t): int(sp_thresh[t][sp])
-                               for t in BIRDNET_THRESHOLDS},
-            "n_plots": len(sp_plots[sp]),
-            "by_plot_type": {expand_pt(k): int(v2)
-                             for k, v2 in sp_plot_type[sp].items()},
-            "pool_size": int(pool),
-            "validation_target": int(target_total),
-            "n_validated": done,
-            "n_true_positive": tp,
-            "pct_of_target": (round(100 * done / target_total, 1)
-                              if target_total else 0.0),
-            "strata": strata,
-            "fit": fit,
-        }
-        # Per-bin precision is what the fit consumes; a pooled ratio over a
-        # stratified sample is not this species' precision, so it is labelled
-        # as sample-only rather than presented as a precision estimate.
-        entry["sample_true_positive_rate"] = (round(tp / done, 3)
-                                              if done else None)
-
-        cutoff = (fit or {}).get("cutoff")
-        if cutoff is not None:
-            retained = sum(n for b, n in bins.items()
-                           if VALIDATION_BIN_EDGES[b] >= cutoff)
-            # Partial stratum containing the cutoff: attribute pro rata.
-            for b, n in bins.items():
-                lo, hi = VALIDATION_BIN_EDGES[b], min(
-                    VALIDATION_BIN_EDGES[b + 1], 1.0)
-                if lo < cutoff < hi and hi > lo:
-                    retained += int(round(n * (hi - cutoff) / (hi - lo)))
-            entry["cutoff"] = cutoff
-            entry["n_retained_positives"] = int(retained)
-            entry["pct_retained"] = (round(100 * retained / pool, 1)
-                                     if pool else None)
-        else:
-            entry["cutoff"] = None
-            entry["n_retained_positives"] = None
-            entry["pct_retained"] = None
-        species.append(entry)
-
-    wildlife = [s for s in species
-                if s["class"] in ("Aves", "Amphibia", "Mammalia")]
-    dates = sorted({d for ds in plot_dates.values() for d in ds})
-    plots = [
-        {"plot": p,
-         "plot_type": expand_pt(plot_type_of_plot.get(p, "")),
-         "n_recording_days": len(plot_dates[p]),
-         "first_date": min(plot_dates[p]),
-         "last_date": max(plot_dates[p])}
-        for p in sorted(plot_dates)
-    ]
-
-    total_pool = sum(s["pool_size"] for s in wildlife)
-    total_target = sum(s["validation_target"] for s in wildlife)
-    total_done = sum(s["n_validated"] for s in wildlife)
-    total_tp = sum(s["n_true_positive"] for s in wildlife)
-    n_fitted = sum(1 for s in wildlife if s.get("cutoff") is not None)
-    cutoffs = sorted(s["cutoff"] for s in wildlife if s.get("cutoff") is not None)
-    retained = sum(s["n_retained_positives"] for s in wildlife
-                   if s.get("n_retained_positives") is not None)
-
-    return {
-        "note": (
-            "BirdNET output is preliminary and unvalidated. Counts are raw "
-            "classifier detections (3-second windows), not verified "
-            "occurrences, and are not corrected for false positives or for "
-            "differences in recording effort among plots."
-        ),
-        "plot_label_note": (
-            "Bird/frog ARUs at turbine plots are logged under the turbine "
-            "code: each unit sits at the edge of the opening with the "
-            "microphone aimed inward, sampling both the opening and the "
-            "adjacent forest."
-        ),
-        "n_detections_total": int(n_rows),
-        "thresholds": BIRDNET_THRESHOLDS,
-        "confidence_floor": float(min(BIRDNET_THRESHOLDS)),
-        "n_species_total": len(species),
-        "n_wildlife_species": len(wildlife),
-        "recording_window": {"first_date": dates[0] if dates else None,
-                             "last_date": dates[-1] if dates else None,
-                             "n_dates": len(dates)},
-        "n_plots": len(plots),
-        "plots": plots,
-        "by_class": [
-            {"class": k, "n_detections": int(v),
-             "n_species": sum(1 for s in species if s["class"] == k)}
-            for k, v in Counter(
-                {c: sum(s["n_detections"] for s in species if s["class"] == c)
-                 for c in {s["class"] for s in species} if c}
-            ).most_common()
-        ],
-        "hourly": {k: [{"hour": h, "n": n}
-                       for h, n in sorted(v.items())]
-                   for k, v in hour_hist.items()
-                   if k in ("Aves", "Amphibia")},
-        "validation": {
-            "design": "stratified_logistic",
-            "n_per_species": VALIDATION_N_PER_SPECIES,
-            "target_p": VALIDATION_TARGET_P,
-            "bin_edges": VALIDATION_BIN_EDGES,
-            "pool_threshold": VALIDATION_POOL_THRESHOLD,
-            "pool_size": int(total_pool),
-            "n_target": int(total_target),
-            "n_validated": int(total_done),
-            "pct_complete": (round(100 * total_done / total_target, 2)
-                             if total_target else 0.0),
-            "n_species_target": len(wildlife),
-            "n_species_fitted": n_fitted,
-            "cutoff_median": (cutoffs[len(cutoffs) // 2] if cutoffs else None),
-            "cutoff_min": (cutoffs[0] if cutoffs else None),
-            "cutoff_max": (cutoffs[-1] if cutoffs else None),
-            "n_retained_positives": int(retained) if n_fitted else None,
-            "sample_true_positive_rate": (round(total_tp / total_done, 3)
-                                          if total_done else None),
-            "log_present": VALIDATION_LOG.exists(),
-            "note": (
-                f"{VALIDATION_N_PER_SPECIES} detections are validated per "
-                f"species, allocated across "
-                f"{len(VALIDATION_BIN_EDGES) - 1} confidence strata. A "
-                f"logistic regression of true-positive outcome on BirdNET "
-                f"confidence gives the cutoff at which "
-                f"P(true positive) = {VALIDATION_TARGET_P:.2f}; detections at "
-                f"or above it are the positives carried into the "
-                f"multi-species occupancy model. Update "
-                f"build/validation_log.csv and rebuild to refresh progress."
-            ),
-            "sampling_note": (
-                "Validations are stratified by confidence, not drawn at "
-                "random, because raw confidences are concentrated near the "
-                "0.25 floor and a random sample would leave the region around "
-                "the cutoff almost unobserved. Stratification means the "
-                "pooled true-positive rate over validated clips is a property "
-                "of the sample, not the precision of the dataset -- read the "
-                "fitted curve and the per-stratum rates instead."
-            ),
-        },
-        "species": species,
-    }
-
-
-# --------------------------------------------------------------------------
-# 5. Validation log template
-# --------------------------------------------------------------------------
-def ensure_validation_log(birdnet: dict) -> None:
-    """Create or extend the validation log: one row per species per stratum.
-
-    Counts you have already entered are preserved, keyed on
-    (species, confidence_bin), so rebuilding after new BirdNET output never
-    discards validation work.
-    """
-    header = ["species", "latin_name", "class", "confidence_bin",
-              "n_available", "target", "n_checked", "n_true_positive", "notes"]
-    existing = {}
-    if VALIDATION_LOG.exists():
-        with VALIDATION_LOG.open() as fh:
-            for row in csv.DictReader(fh):
-                name = (row.get("species") or "").strip()
-                cbin = (row.get("confidence_bin") or "").strip()
-                if name and cbin:
-                    existing[(name, cbin)] = row
-
-    rows = []
-    for s in birdnet["species"]:
-        if s["class"] not in ("Aves", "Amphibia", "Mammalia"):
-            continue
-        for st in s["strata"]:
-            prev = existing.get((s["species"], st["bin"]), {})
-            rows.append({
-                "species": s["species"],
-                "latin_name": s["latin_name"] or "",
-                "class": s["class"] or "",
-                "confidence_bin": st["bin"],
-                "n_available": st["n_available"],
-                "target": st["target"],
-                "n_checked": prev.get("n_checked", "0"),
-                "n_true_positive": prev.get("n_true_positive", "0"),
-                "notes": prev.get("notes", ""),
-            })
-
-    VALIDATION_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with VALIDATION_LOG.open("w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=header)
-        w.writeheader()
-        w.writerows(rows)
-    n_sp = len({r["species"] for r in rows})
-    log(f"validation log: {len(rows)} stratum rows across {n_sp} species -> "
-        f"{VALIDATION_LOG.relative_to(ROOT)}")
-
-
-# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 def main() -> int:
     if not RAW.exists():
-        print(f"ERROR: raw data directory not found: {RAW}", file=sys.stderr)
+        print(f"ERROR: data directory not found: {RAW}", file=sys.stderr)
         return 1
 
     print("Timbermill dashboard :: building summaries")
 
-    print("[1/5] locations")
-    loc_payload, loc_df = build_locations()
-    write_json("locations.json", loc_payload)
+    print("[1/5] AHDriFT bucket cameras (cleaned detection table)")
+    ahdrift, ah_rows, ah_counts = build_ahdrift()
+    write_json("species_ahdrift.json", ahdrift)
 
-    print("[2/5] deployment effort")
-    effort = build_effort(loc_df)
-    write_json("effort.json", effort)
-
-    print("[3/5] camera species (Wildlife Insights)")
-    bucket, parallel, cam_progress = build_camera_species()
-    write_json("species_ahdrift.json", bucket)
+    print("[2/5] parallel camera traps (Wildlife Insights)")
+    loc_df = load_locations()
+    parallel, ct_rows, ct_counts, ct_extra = build_camera_traps(loc_df)
     write_json("species_parallel.json", parallel)
 
-    print("[4/5] BirdNET acoustic detections")
-    birdnet = build_birdnet()
+    print("[3/5] BirdNET acoustic detections")
+    birdnet, aru_counts = build_birdnet()
     write_json("birdnet.json", birdnet)
-    ensure_validation_log(birdnet)
 
-    # Rebuild BirdNET validation figures if the log was empty on first run and
-    # has since been populated -- cheap because the log is tiny.
+    print("[4/5] locations and effort")
+    loc_payload = build_locations(loc_df, ah_counts, ct_counts, aru_counts,
+                                  ah_rows, ct_extra["sites"],
+                                  birdnet["plots"])
+    write_json("locations.json", loc_payload)
+    effort = build_effort(ah_rows, ct_rows, ahdrift, parallel)
+    write_json("effort.json", effort)
+
     print("[5/5] manifest")
-    # media.json is produced by the media pipeline, not here. If it already
-    # exists its item counts are folded into the view registry; the frontend
-    # also reads media.json directly and prefers that live count, so a stale
-    # or absent value here degrades to a correct display either way.
     media_path = OUT / "media.json"
     media = {}
     if media_path.exists():
         try:
             media = json.loads(media_path.read_text())
         except json.JSONDecodeError:
-            log("WARNING: media.json is present but unparseable; "
-                "media counts omitted from the manifest")
+            log("WARNING: media.json is present but unparseable")
 
     def media_count(view: str) -> int:
-        items = media.get("views", {}).get(view, {}).get("items", [])
-        return len(items)
+        return len(media.get("views", {}).get(view, {}).get("items", []))
 
     # ---- data gaps -------------------------------------------------------
-    # Surface upstream inconsistencies on the dashboard rather than hiding
-    # them: a plot that produced data but has no coordinate record cannot be
-    # mapped, and that is worth seeing while annotation is still in progress.
-    mappable = {p["plot"] for p in loc_payload["points"] if p["plot"]}
+    mappable_plots = {p["plot"] for p in loc_payload["points"] if p["plot"]}
+    mapped_keys = {norm_key(p["id"]) for p in loc_payload["points"]}
     gaps = []
     for p in birdnet["plots"]:
-        if p["plot"] not in mappable:
+        if p["plot"] not in mappable_plots:
             gaps.append({
-                "kind": "missing_location",
-                "id": p["plot"],
-                "detail": (
-                    f"ARU plot {p['plot']} has {p['n_recording_days']} "
-                    f"recording days in the BirdNET output "
-                    f"({p['first_date']} to {p['last_date']}) but no entry in "
-                    f"the location table, so it cannot be mapped."
-                ),
+                "kind": "missing_location", "id": p["plot"],
+                "detail": (f"ARU plot {p['plot']} has {p['n_recording_days']} "
+                           f"recording days in the BirdNET output "
+                           f"({p['first_date']} to {p['last_date']}) but no "
+                           f"entry in the location table, so it cannot be "
+                           f"mapped."),
             })
+    unmapped_ct = sorted({r["point"] for r in ct_rows
+                          if r["point_key"] not in mapped_keys})
+    if unmapped_ct:
+        gaps.append({
+            "kind": "missing_location", "id": ", ".join(unmapped_ct),
+            "detail": (f"{len(unmapped_ct)} parallel-camera station(s) "
+                       f"({', '.join(unmapped_ct)}) have Wildlife Insights "
+                       f"deployments but no row in "
+                       f"cam_trap_locations_info.csv, so they contribute "
+                       f"effort and detections but no marker."),
+        })
+    if birdnet["labels_not_in_threshold_file"]:
+        names = ", ".join(x["species"] for x
+                          in birdnet["labels_not_in_threshold_file"][:8])
+        gaps.append({
+            "kind": "unlisted_label", "id": names,
+            "detail": (f"{len(birdnet['labels_not_in_threshold_file'])} "
+                       f"BirdNET label(s) ({names}) have no row in "
+                       f"BirdNet_Thresholds.csv, so no validation state is "
+                       f"known and they are excluded from every figure."),
+        })
+    herp_in_data = {s["common_name"] for s in ahdrift["species"]
+                    if s["class"] in ("Reptilia", "Amphibia")}
+    album = media.get("views", {}).get("bucket_camera", {}).get("items", [])
+    herp_with_photo = {i.get("common_name") for i in album}
+    missing_photo = sorted(herp_in_data - herp_with_photo)
+    if album and missing_photo:
+        gaps.append({
+            "kind": "missing_photo", "id": ", ".join(missing_photo),
+            "detail": (f"{len(missing_photo)} reptile/amphibian taxon(s) in "
+                       f"the cleaned AHDriFT table have no photograph in the "
+                       f"album: {', '.join(missing_photo)}."),
+        })
+
+    ah_rate = ahdrift["rate"]
+    ct_rate = parallel["rate"]
+    bv = birdnet["validation"]
+    identification = {
+        "ahdrift": {
+            "label": "Bucket cameras (AHDriFT)",
+            "stats": [
+                ["Plot-days reviewed", ahdrift["n_plot_days"],
+                 f"across {ah_rate['n_sites']} plots, "
+                 f"{ahdrift['date_range']['first']} to "
+                 f"{ahdrift['date_range']['last']}"],
+                ["Detection events identified", ahdrift["n_detections"],
+                 f"{ahdrift['n_species']} taxa in "
+                 f"{len(ahdrift['by_class'])} classes"],
+                ["Plot-days with no detection", ahdrift["n_blank_plot_days"],
+                 f"{round(100 * ahdrift['n_blank_plot_days'] / max(ahdrift['n_plot_days'], 1))}%"
+                 f" of reviewed plot-days, recorded explicitly as zeroes"],
+                ["Hut-days surveyed", ah_rate["total_hut_days"],
+                 f"{ah_rate['total_array_days']} array-days; "
+                 f"the detection-rate denominator"],
+            ],
+            "note": (
+                "Motion-capture identification is complete for the 2026 "
+                "season. Because plot-days with no detection are recorded "
+                "rather than left out, survey effort, detection rate and "
+                "naive occupancy are all computable from this one table."
+            ),
+        },
+        "parallel": {
+            "label": "Parallel cameras",
+            "stats": [
+                ["Sequences reviewed",
+                 ct_extra["progress"]["n_sequences_human_reviewed"],
+                 f"of {ct_extra['progress']['n_sequences_total']} in the "
+                 f"export "
+                 f"({ct_extra['progress']['pct_human_reviewed']}%), by "
+                 f"{ct_extra['progress']['n_reviewers']} reviewers"],
+                ["Images uploaded",
+                 ct_extra["progress"]["n_images_uploaded"], None],
+                ["Species-level sequences", parallel["n_identified_sequences"],
+                 f"{parallel['n_coarse_sequences']} more stop at a coarse or "
+                 f"non-wildlife label"],
+                ["Camera-days logged", round(ct_rate["total_camera_days"]),
+                 f"across {ct_rate['n_sites']} stations"],
+            ],
+            "note": (
+                "The AHDriFT rows in the same export "
+                f"({ct_extra['progress']['n_sequences_ahdrift_in_export']} "
+                "sequences) are no longer used anywhere on this dashboard; "
+                "the cleaned bucket-camera table supersedes them."
+            ),
+        },
+        "birdnet": {
+            "label": "Bird and frog audio (BirdNET)",
+            "stats": [
+                ["Clips listened to", bv["n_clips_listened"],
+                 f"{bv['n_clips_positive']} true positives, "
+                 f"{bv['n_clips_negative']} false, {bv['n_clips_skipped']} "
+                 f"skipped"],
+                ["Species with a 95% cutoff", bv["n_species_validated"],
+                 f"cutoffs {bv['cutoff_min']}-{bv['cutoff_max']}, median "
+                 f"{bv['cutoff_median']}"],
+                ["Detections kept after filtering",
+                 bv["n_detections_validated_retained"],
+                 f"{bv['pct_retained_validated']}% of the "
+                 f"{bv['n_detections_validated_raw']} raw detections of those "
+                 f"species"],
+                ["Species still unvalidated",
+                 bv["n_species_pending"] + bv["n_species_frogs"]
+                 + bv["n_species_no_cutoff"],
+                 f"{bv['n_species_frogs']} anurans, "
+                 f"{bv['n_species_pending']} birds in the queue, "
+                 f"{bv['n_species_no_cutoff']} birds with no attainable "
+                 f"cutoff"],
+            ],
+            "note": bv["note"],
+        },
+    }
 
     views = [
-        {
-            "id": "bucket_camera",
-            "label": "Bucket Cameras (AHDriFT)",
-            "short": "AHDriFT",
-            "status": "available",
-            "taxa": "Reptiles, amphibians, small mammals",
-            "sensor_type": "AHDriFT",
-            "n_species": bucket["n_species"],
-            "n_deployments": effort["summary"]["bucket_camera"]["n_deployments"],
-            "sensor_days": effort["summary"]["bucket_camera"]["total_sensor_days"],
-            "n_media": media_count("bucket_camera"),
-        },
-        {
-            "id": "parallel_camera",
-            "label": "Parallel Cameras",
-            "short": "Camera Traps",
-            "status": "available",
-            "taxa": "Mid-sized and large mammals",
-            "sensor_type": "Camera Trap",
-            "n_species": parallel["n_species"],
-            "n_deployments": effort["summary"]["parallel_camera"]["n_deployments"],
-            "sensor_days": effort["summary"]["parallel_camera"]["total_sensor_days"],
-            "n_media": media_count("parallel_camera"),
-        },
-        {
-            "id": "bird_frog_audio",
-            "label": "Bird & Frog Audio",
-            "short": "Bird/Frog ARUs",
-            "status": "available",
-            "taxa": "Vocalizing birds and anurans",
-            "sensor_type": "ARU",
-            "n_species": birdnet["n_wildlife_species"],
-            "n_deployments": birdnet["n_plots"],
-            "sensor_days": sum(p["n_recording_days"]
-                               for p in birdnet["plots"]),
-            "n_media": media_count("bird_frog_audio"),
-        },
-        {
-            "id": "bat_audio",
-            "label": "Bat Audio",
-            "short": "Bat ARUs",
-            "status": "pending",
-            "taxa": "Bats (ultrasonic)",
-            "sensor_type": "Ultrasonic ARU",
-            "pending_note": (
-                "26,268 ultrasonic recordings were collected at 50 locations "
-                "for 14-55 nights each. Classification with Kaleidoscope Pro "
-                "has not yet begun."
-            ),
-        },
-        {
-            "id": "vegetation",
-            "label": "Vegetation",
-            "short": "Vegetation",
-            "status": "pending",
-            "taxa": "Understory structure and canopy cover",
-            "sensor_type": "Wiens pole / densiometer",
-            "pending_note": (
-                "Wiens-pole understory measurements (41 points per sensor "
-                "location) and 360-degree canopy photographs were collected "
-                "June-July 2026 and are being digitized."
-            ),
-        },
+        {"id": "bucket_camera", "label": "Bucket Cameras (AHDriFT)",
+         "short": "AHDriFT", "status": "available",
+         "taxa": "Reptiles, amphibians, small mammals",
+         "sensor_type": "AHDriFT",
+         "n_species": ahdrift["n_species"],
+         "n_deployments": effort["summary"]["bucket_camera"]["n_deployments"],
+         "sensor_days": effort["summary"]["bucket_camera"]["total_sensor_days"],
+         "n_media": media_count("bucket_camera")},
+        {"id": "parallel_camera", "label": "Parallel Cameras",
+         "short": "Camera Traps", "status": "available",
+         "taxa": "Mid-sized and large mammals",
+         "sensor_type": "Camera Trap",
+         "n_species": parallel["n_species"],
+         "n_deployments": effort["summary"]["parallel_camera"]["n_deployments"],
+         "sensor_days": effort["summary"]["parallel_camera"]["total_sensor_days"],
+         "n_media": media_count("parallel_camera")},
+        {"id": "bird_frog_audio", "label": "Bird & Frog Audio",
+         "short": "Bird/Frog ARUs", "status": "available",
+         "taxa": "Vocalizing birds and anurans", "sensor_type": "ARU",
+         "n_species": birdnet["n_wildlife_species"],
+         "n_deployments": birdnet["n_plots"],
+         "sensor_days": sum(p["n_recording_days"] for p in birdnet["plots"]),
+         "n_media": media_count("bird_frog_audio")},
+        {"id": "bat_audio", "label": "Bat Audio", "short": "Bat ARUs",
+         "status": "pending", "taxa": "Bats (ultrasonic)",
+         "sensor_type": "Ultrasonic ARU",
+         "pending_note": (
+             "26,268 ultrasonic recordings were collected at 50 locations "
+             "for 14-55 nights each. Classification with Kaleidoscope Pro "
+             "has not yet begun.")},
+        {"id": "vegetation", "label": "Vegetation", "short": "Vegetation",
+         "status": "pending",
+         "taxa": "Understory structure and canopy cover",
+         "sensor_type": "Wiens pole / densiometer",
+         "pending_note": (
+             "Wiens-pole understory measurements (41 points per sensor "
+             "location) and 360-degree canopy photographs were collected "
+             "June-July 2026 and are being digitized.")},
     ]
 
     manifest = {
@@ -1073,27 +1601,38 @@ def main() -> int:
             "%Y-%m-%d %H:%M UTC"),
         "disclaimer": (
             "PRELIMINARY DATA -- annotation and validation are in progress. "
-            "All counts are provisional, unvalidated, and uncorrected for "
-            "survey effort or false positives. Do not cite, redistribute, or "
-            "draw ecological conclusions from these figures."
+            "Bucket-camera identifications are complete; acoustic bird "
+            "detections are filtered to validated per-species cutoffs, and "
+            "anuran detections are not validated at all. Counts are "
+            "provisional. Do not cite, redistribute, or draw ecological "
+            "conclusions from these figures."
         ),
         "plot_types": PLOT_TYPE_ORDER,
+        "class_labels": CLASS_LABELS,
+        "class_order": CLASS_ORDER,
         "views": views,
         "totals": {
             "n_sensor_points": loc_payload["n_points"],
             "n_plots": loc_payload["n_plots"],
-            "n_camera_deployments": effort["n_deployment_rows_used"],
-            "n_sequences": cam_progress["n_sequences_total"],
-            "n_sequences_reviewed": cam_progress["n_sequences_human_reviewed"],
-            "n_images_uploaded": cam_progress["n_images_uploaded"],
+            "n_camera_deployments": len(ct_rows),
+            "n_ahdrift_arrays": len(ah_rows),
+            "n_sequences": ct_extra["progress"]["n_sequences_total"],
+            "n_sequences_reviewed":
+                ct_extra["progress"]["n_sequences_human_reviewed"],
+            "n_images_uploaded": ct_extra["progress"]["n_images_uploaded"],
+            "n_ahdrift_detections": ahdrift["n_detections"],
+            "n_ahdrift_plot_days": ahdrift["n_plot_days"],
             "n_birdnet_detections": birdnet["n_detections_total"],
+            "n_birdnet_retained": birdnet["n_detections_retained"],
+            "n_clips_listened": bv["n_clips_listened"],
             "n_camera_species": len({s["common_name"]
-                                     for s in bucket["species"]} |
-                                    {s["common_name"]
-                                     for s in parallel["species"]}),
+                                     for s in ahdrift["species"]}
+                                    | {s["common_name"]
+                                       for s in parallel["species"]}),
             "n_acoustic_species": birdnet["n_wildlife_species"],
         },
-        "annotation_progress": cam_progress,
+        "annotation_progress": ct_extra["progress"],
+        "identification_progress": identification,
         "data_gaps": gaps,
     }
     write_json("manifest.json", manifest)

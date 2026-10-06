@@ -1,7 +1,7 @@
 """Render one publication-quality spectrogram PNG per ARU clip.
 
-Outputs land in docs/media/spectrograms/. Raw audio is read from raw_data/
-and never copied into docs/.
+Outputs land in docs/media/spectrograms/. Raw audio is read from data/ and
+never copied into docs/; only the transcoded excerpt is published.
 """
 import json
 import os
@@ -13,8 +13,8 @@ import matplotlib.pyplot as plt
 from scipy.io import wavfile
 from scipy.signal import spectrogram
 
-REPO = "/home/will/NCSU/Claude_Science/2026_Sensor_Dashboard"
-AUDIO_IN = os.path.join(REPO, "raw_data", "Audio_Data")
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+AUDIO_IN = os.path.join(REPO, "data", "Audio_Data")
 SPEC_OUT = os.path.join(REPO, "docs", "media", "spectrograms")
 
 PLOT_TYPE_COLOR = {
@@ -87,8 +87,15 @@ def discover_clips():
             latin_name=row.get("latin_name"),
             taxon_class=row.get("class"),
             n_detections=row.get("n_detections"),
+            n_detections_raw=row.get("n_detections_raw"),
             n_plots=row.get("n_plots"),
             by_plot_type=row.get("by_plot_type") or {},
+            # Validation state decides how the counts may be described: a
+            # cutoff-filtered count must not be called unvalidated, and an
+            # unvalidated one must not be called filtered.
+            group=row.get("group"),
+            threshold=row.get("threshold"),
+            validation=row.get("validation") or {},
         )
     return clips, problems
 
@@ -136,17 +143,36 @@ def render(fname, meta, outdir=SPEC_OUT):
 
     # Wrapped to the axes width: the caption is long enough to run off the
     # canvas as a single line, which silently truncates it in the PNG.
+    if meta.get("threshold") is not None:
+        counts = (f"BirdNET logged {meta['n_detections']:,} detections of "
+                  f"this species at or above its validated cutoff of "
+                  f"{meta['threshold']:g}, at {meta['n_plots']} plots.")
+    else:
+        counts = (f"BirdNET logged {meta['n_detections']:,} unvalidated "
+                  f"detections of this species at {meta['n_plots']} plots.")
     caption = (f"Songmeter Micro 2, {dur:.0f} s excerpt, {sr/1000:g} kHz mono. "
-               f"Identified by ear; BirdNET logged "
-               f"{meta['n_detections']:,} unvalidated detections of this "
-               f"species at {meta['n_plots']} plots.")
+               f"Identified by ear; {counts}")
     # Wrap width 72 measured against the rendered text extent at this figure
     # size and font; wider values push the last line past the canvas edge.
-    fig.text(0.105, 0.015, "\n".join(textwrap.wrap(caption, 72)),
-             ha="left", va="bottom",
-             fontsize=mpl.rcParams["legend.fontsize"], color="#444444")
+    lines = textwrap.wrap(caption, 72)
+    cap = fig.text(0.105, 0.015, "\n".join(lines), ha="left", va="bottom",
+                   fontsize=mpl.rcParams["legend.fontsize"], color="#444444")
 
+    # The axes bottom has to clear the caption AND the x-axis label, and the
+    # caption's height depends on how many lines it wrapped to: a
+    # cutoff-filtered count runs a line longer than an unvalidated one. Rather
+    # than guess a margin that fits one of those and buries the axis label on
+    # the other, both are measured from a first render and the margin is set
+    # from what they actually occupy.
     fig.subplots_adjust(left=0.105, right=0.965, top=0.90, bottom=0.26)
+    fig.canvas.draw()
+    inv = fig.transFigure.inverted()
+    cap_top = inv.transform(cap.get_window_extent().corners()[1])[1]
+    lab = ax.xaxis.label.get_window_extent()
+    lab_h = (inv.transform(lab.corners()[1])[1]
+             - inv.transform(lab.corners()[0])[1])
+    fig.subplots_adjust(left=0.105, right=0.965, top=0.90,
+                        bottom=cap_top + lab_h + 0.085)
 
     out = os.path.join(outdir, meta["clip_id"] + ".png")
     fig.savefig(out, dpi=DPI)

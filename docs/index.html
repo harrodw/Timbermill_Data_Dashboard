@@ -124,6 +124,14 @@
         <p class="panel-sub" id="species-sub"></p>
       </div>
       <div class="controls" id="species-controls">
+        <label class="control" id="species-group-wrap" hidden>
+          <span>Validation group</span>
+          <select id="species-group"></select>
+        </label>
+        <label class="control">
+          <span>Class</span>
+          <select id="species-class"></select>
+        </label>
         <label class="control">
           <span>Show</span>
           <select id="species-topn">
@@ -149,14 +157,58 @@
             <option value="total">Total only</option>
           </select>
         </label>
-        <label class="control" id="species-threshold-wrap" hidden>
-          <span>Confidence</span>
-          <select id="species-threshold"></select>
-        </label>
       </div>
       <div id="species-chart" class="chart chart-species"></div>
       <p class="panel-note" id="species-note"></p>
       <div class="panel-error-slot" id="species-error" hidden></div>
+    </section>
+
+    <!-- ACTIVITY PATTERNS -->
+    <section class="panel" id="panel-activity" aria-labelledby="h-activity">
+      <div class="panel-head">
+        <h3 id="h-activity">Daily activity pattern</h3>
+        <p class="panel-sub" id="activity-sub"></p>
+      </div>
+      <div class="controls" id="activity-controls">
+        <label class="control">
+          <span>Class</span>
+          <select id="activity-class"></select>
+        </label>
+        <label class="control control-wide">
+          <span>Species</span>
+          <select id="activity-species"></select>
+        </label>
+      </div>
+      <div id="activity-stats" class="mini-stats"></div>
+      <div id="activity-chart" class="chart chart-activity"></div>
+      <div class="panel-note" id="activity-note"></div>
+      <div class="panel-error-slot" id="activity-error" hidden></div>
+    </section>
+
+    <!-- DETECTION RATE vs NAIVE OCCUPANCY (camera views only) -->
+    <section class="panel" id="panel-tree" aria-labelledby="h-tree" hidden>
+      <div class="panel-head">
+        <h3 id="h-tree">Detection rate and naive occupancy</h3>
+        <p class="panel-sub" id="tree-sub"></p>
+      </div>
+      <div class="controls" id="tree-controls">
+        <label class="control">
+          <span>Class</span>
+          <select id="tree-class"></select>
+        </label>
+        <label class="control">
+          <span>Show</span>
+          <select id="tree-topn">
+            <option value="15">Top 15</option>
+            <option value="25" selected>Top 25</option>
+            <option value="all">All taxa</option>
+          </select>
+        </label>
+      </div>
+      <div id="tree-stats" class="mini-stats"></div>
+      <div id="tree-chart" class="chart chart-tree"></div>
+      <p class="panel-note" id="tree-note"></p>
+      <div class="panel-error-slot" id="tree-error" hidden></div>
     </section>
 
     <!-- VALIDATION (bird_frog_audio only) -->
@@ -166,6 +218,7 @@
         <p class="panel-sub" id="validation-sub"></p>
       </div>
       <div id="validation-overall" class="validation-overall"></div>
+      <div id="validation-groups" class="validation-groups"></div>
       <p class="panel-note" id="validation-note"></p>
       <div class="table-scroll">
         <table class="data-table" id="validation-table">
@@ -176,6 +229,17 @@
       </div>
       <p class="panel-note" id="validation-foot"></p>
       <div class="panel-error-slot" id="validation-error" hidden></div>
+    </section>
+
+    <!-- IDENTIFICATION & VALIDATION EFFORT (all views) -->
+    <section class="panel" id="panel-ident" aria-labelledby="h-ident">
+      <div class="panel-head">
+        <h3 id="h-ident">Identification and validation effort</h3>
+        <p class="panel-sub">How much of each sensor stream has been reviewed, and by what
+          procedure. These are the numbers behind every count on this page.</p>
+      </div>
+      <div id="ident-body" class="ident-body"></div>
+      <div class="panel-error-slot" id="ident-error" hidden></div>
     </section>
 
     <!-- MEDIA -->
@@ -210,6 +274,10 @@
       <h2>Annotation progress</h2>
       <div id="foot-annotation" class="foot-stats"></div>
       <p class="panel-note" id="foot-annotation-note"></p>
+    </section>
+    <section class="foot-block">
+      <h2>Known data gaps</h2>
+      <div id="foot-gaps" class="foot-gaps"></div>
     </section>
     <section class="foot-block">
       <h2>Data sources</h2>

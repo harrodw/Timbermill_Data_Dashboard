@@ -65,20 +65,78 @@ export function legendCounts(points) {
     .map(pt => ({ plot_type: pt, n: counts.get(pt) }));
 }
 
-function popupHTML(p, view) {
-  const rows = [
-    ['Sensor', p.id],
+/** The detection block this view publishes for a point, if any. */
+export function detectionsFor(point, viewId) {
+  const d = point && point.detections;
+  return (d && d[viewId]) ? d[viewId] : null;
+}
+
+/**
+ * Species-tally table for a marker.
+ *
+ * Capped on hover and complete on click. An ARU plot carries detections of
+ * sixty-odd species, which is a useful list to be able to read in full and an
+ * unusable one to have follow the cursor around, so the hover tooltip shows
+ * the leading rows and says how many it left out.
+ */
+function speciesTableHTML(det, limit) {
+  const rows = Array.isArray(det.species) ? det.species : [];
+  if (!rows.length) {
+    return '<p class="popup-empty">No detections recorded at this sensor.</p>';
+  }
+  const shown = (limit && rows.length > limit) ? rows.slice(0, limit) : rows;
+  const body = shown.map(s =>
+    `<tr><th>${escapeHTML(s.name)}</th><td>${fmtInt(s.n)}</td></tr>`).join('');
+  const hiddenHere = rows.length - shown.length;
+  // species_truncated counts rows the BUILD dropped before publishing; add it
+  // to the rows this render is hiding, so the "+N more" is never an undercount.
+  const hiddenUpstream = Number(det.species_truncated) || 0;
+  const more = hiddenHere + hiddenUpstream;
+  return `<table class="popup-table popup-species">${body}</table>` +
+         (more
+           ? `<p class="popup-more">+${fmtInt(more)} more species\u2014click the marker for the full list.</p>`
+           : '');
+}
+
+function popupHTML(p, viewId, opts) {
+  const o = opts || {};
+  const det = detectionsFor(p, viewId);
+  const head = [
     ['Plot', p.plot],
     ['Plot type', p.plot_type],
-    ['Sensor type', p.sensor_type],
-    ['Approx. position', `${Number(p.lat).toFixed(3)}, ${Number(p.lon).toFixed(3)}`]
+    ['Sensor', p.sensor_type]
   ];
-  if (view && view.extraRows) rows.push(...view.extraRows(p));
-  const body = rows.map(([k, v]) =>
-    `<tr><th>${escapeHTML(k)}</th><td>${escapeHTML(v)}</td></tr>`).join('');
+  if (det) {
+    head.push([det.unit.charAt(0).toUpperCase() + det.unit.slice(1),
+      `${fmtInt(det.n_detections)} of ${fmtInt(det.n_species)} taxa`]);
+    if (det.effort) head.push(['Effort', det.effort]);
+  }
+  if (o.full) {
+    head.push(['Approx. position',
+      `${Number(p.lat).toFixed(3)}, ${Number(p.lon).toFixed(3)}`]);
+  }
+  const headBody = head.filter(([, v]) => v !== null && v !== undefined)
+    .map(([k, v]) => `<tr><th>${escapeHTML(k)}</th><td>${escapeHTML(v)}</td></tr>`)
+    .join('');
+
+  let detail = '';
+  if (det) {
+    const scope = det.scope === 'plot'
+      ? `Tallied for the ${escapeHTML(det.scope_label)} \u2014 the plot carries one.`
+      : `Tallied for ${escapeHTML(det.scope_label)}.`;
+    detail = `<p class="popup-scope">${scope}</p>` +
+             speciesTableHTML(det, o.full ? null : 14);
+  } else {
+    detail = '<p class="popup-empty">This view publishes no detection tally for ' +
+             'this sensor.</p>';
+  }
+
   return `<div class="popup-title">${escapeHTML(p.id)}</div>` +
-         `<table class="popup-table">${body}</table>` +
-         `<p class="popup-approx">Position is displaced by design; see the note above the map.</p>`;
+         `<table class="popup-table">${headBody}</table>` +
+         detail +
+         (o.full
+           ? '<p class="popup-approx">Position is displaced by design; see the note above the map.</p>'
+           : '');
 }
 
 function escapeHTML(s) {
@@ -156,6 +214,12 @@ export async function renderMap(ctx) {
   const noteEl = $('#map-note');
   if (noteEl) {
     const parts = [];
+    if (locations.popup_note) parts.push(locations.popup_note);
+    const withTallies = points.filter(p => detectionsFor(p, viewId)).length;
+    if (points.length && withTallies < points.length) {
+      parts.push(`${fmtInt(points.length - withTallies)} of ${fmtInt(points.length)} ` +
+        `markers recorded nothing in this view and carry no species list.`);
+    }
     if (viewId === 'bird_frog_audio') {
       const missing = unlocatedAruPlots(locations, birdnet);
       if (missing.length) {
@@ -220,7 +284,7 @@ export async function renderMap(ctx) {
 
   layer = L.layerGroup();
   for (const pt of valid) {
-    L.circleMarker([pt.lat, pt.lon], {
+    const marker = L.circleMarker([pt.lat, pt.lon], {
       radius: 6,
       color: '#ffffff',
       weight: 1.5,
@@ -228,7 +292,16 @@ export async function renderMap(ctx) {
       fillColor: plotColor(pt.plot_type),
       fillOpacity: 0.92,
       className: 'sensor-marker'
-    }).bindPopup(popupHTML(pt, view), { maxWidth: 300 }).addTo(layer);
+    });
+    // Hover gives the capped species tally straight away; click pins the
+    // full list, which is the only readable way to show sixty-odd species.
+    marker.bindTooltip(popupHTML(pt, viewId, { full: false }), {
+      sticky: true, direction: 'top', opacity: 1,
+      className: 'sensor-tooltip'
+    });
+    marker.bindPopup(popupHTML(pt, viewId, { full: true }), { maxWidth: 340 });
+    marker.on('popupopen', () => marker.closeTooltip());
+    marker.addTo(layer);
   }
   layer.addTo(map);
   map.fitBounds(L.latLngBounds(valid.map(p => [p.lat, p.lon])).pad(0.12));

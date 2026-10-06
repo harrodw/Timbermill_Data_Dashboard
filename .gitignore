@@ -2,12 +2,19 @@
 # Timbermill Wind & Wildlife dashboard
 #
 # PRELIMINARY DATA POLICY: nothing raw is published. The build pipeline reads
-# raw_data/ locally and writes only aggregated summaries into docs/data/.
+# data/ locally and writes only aggregated summaries into docs/data/.
 # Everything below must never reach the public repository.
 # ---------------------------------------------------------------------------
 
-# Raw sensor data (Wildlife Insights exports, BirdNET detections, media, coords)
+# Raw sensor data (Wildlife Insights exports, BirdNET detections, media, coords).
+# The source directory was renamed raw_data/ -> data/; BOTH are ignored so a
+# rename in either direction can never publish 800 MB of unreleased detections
+# and full-precision sensor coordinates. docs/data/ holds the generated
+# summaries and is explicitly re-included below.
+data/
 raw_data/
+!docs/data/
+!docs/data/**
 
 # Full-precision coordinates and any other local-only intermediate
 private/

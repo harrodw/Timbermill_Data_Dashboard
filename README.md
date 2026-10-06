@@ -4,9 +4,11 @@ A static dashboard reporting annotation progress for the 2026 field season of
 *Harnessing Wind Energy within Industrial Forests: Effects on Wildlife*
 (Will Harrod, NC State University; Chowan County, North Carolina).
 
-**All published figures are preliminary and unvalidated.** The site carries that
-disclaimer as a sticky banner that also survives printing, so a screenshotted or
-printed chart keeps its caveat.
+**Published figures remain preliminary.** Bucket-camera identifications are
+complete; acoustic bird detections are filtered to per-species validated
+cutoffs; anuran detections are not validated at all. The site carries that
+caveat as a sticky banner that also survives printing, so a screenshotted or
+printed chart keeps it.
 
 ---
 
@@ -16,206 +18,258 @@ The dashboard is deliberately split in two, because the raw data cannot be
 published:
 
 ```
-raw_data/  ──►  build/build_summaries.py  ──►  docs/data/*.json  ──►  docs/index.html
-(private,        aggregates locally,           summaries only,        static site
- git-ignored)    ~12 seconds                   ~230 KB total          (GitHub Pages)
+data/  ──►  build/build_summaries.py  ──►  docs/data/*.json  ──►  docs/index.html
+(private,   aggregates locally,           summaries only,        static site
+ git-ignored)  ~15 seconds                ~440 KB total          (GitHub Pages)
 ```
 
-Nothing under `raw_data/` is ever committed or copied into `docs/`. The pipeline
-reads 565 MB of Wildlife Insights exports and 3.6 million BirdNET detections and
-writes only aggregate counts. `docs/` is fully self-contained: Leaflet and Plotly
-are vendored into `docs/assets/vendor/`, so the site renders with no network
-access at all (the only exception is the background map tiles — markers, legend
-and all data still render without them).
+Nothing under `data/` is ever committed or copied into `docs/`. The pipeline
+reads the Wildlife Insights export, the cleaned AHDriFT detection table and
+3.57 million BirdNET detections, and writes only aggregate counts. `docs/` is
+fully self-contained: Leaflet and Plotly are vendored into
+`docs/assets/vendor/`, so the site renders with no network access at all (the
+only exception is the background map tiles — markers, legend, charts and all
+data still render without them).
+
+## Which file backs which view
+
+This is the part that changed most recently, and getting it wrong would
+double-count the bucket cameras:
+
+| View | Source | Unit |
+|---|---|---|
+| Bucket cameras (AHDriFT) | `data/Clean_AHDriFT_Data/ahdrift_data_cleaned.csv` | detection events |
+| Parallel cameras | `data/WI_Download/sequences.csv`, **CT deployments only** | sequences |
+| Bird & frog audio | `preliminary_BirdNET_Results.csv` + `BirdNet_Thresholds.csv` | classifier detections |
+
+The Wildlife Insights export still contains 4,945 AHDriFT sequences. They are
+**not used anywhere on the dashboard**: the cleaned table carries the final
+identifications and — critically — one row per surveyed plot-day that produced
+nothing. Those recorded zeroes are what make survey effort, detection rate and
+naive occupancy computable for the bucket cameras at all.
 
 ## Layout
 
 | Path | Committed | Purpose |
 |---|---|---|
 | `build/build_summaries.py` | yes | The pipeline. Run from the repo root. |
-| `build/validation_log.csv` | yes | Your BirdNET validation tally — **edit this by hand**. |
+| `build/make_photos.py` | yes | Photo selection, resize, EXIF strip. |
+| `build/make_spectrograms.py` | yes | ARU clip spectrograms + audio transcode. |
+| `build/make_media_json.py` | yes | Captions and the media manifest. |
+| `build/photo_selection.json` | yes | Generated: which photo was published per taxon, with its Wildlife Insights identification. |
 | `docs/index.html` | yes | The dashboard. GitHub Pages serves this folder. |
-| `docs/assets/` | yes | CSS, six ES modules, and vendored Leaflet + Plotly. |
+| `docs/assets/` | yes | CSS, six ES modules, vendored Leaflet + Plotly. |
 | `docs/data/*.json` | yes | Generated summaries. Safe to publish. |
 | `docs/media/` | yes | Web-sized, EXIF-stripped photos, spectrograms, audio. |
-| `raw_data/` | **no** | Source data. Git-ignored. |
+| `data/` | **no** | Source data. Git-ignored. |
 | `private/` | **no** | Verification scripts and screenshots. Git-ignored. |
 
-## Rebuilding the summaries
+## Rebuilding
 
 ```bash
 cd /home/will/NCSU/Claude_Science/2026_Sensor_Dashboard
-python build/build_summaries.py
+python build/build_summaries.py     # ~15 s; rewrites docs/data/*.json
 ```
 
-Requires `pandas`. It rewrites the six JSON files under `docs/data/` and
-refreshes `build/validation_log.csv`, preserving any counts you have entered.
-Re-run it whenever you re-export from Wildlife Insights, re-run BirdNET, or log
-more validations — then commit and push.
+Requires `pandas`. Re-run it whenever you re-export from Wildlife Insights,
+re-run BirdNET, update the cleaned AHDriFT table, or **edit
+`BirdNet_Thresholds.csv`** — that last one changes every acoustic count on the
+site.
 
-The media assets are built by three separate scripts, which only need re-running
-when you add new photos or audio clips:
+The media assets are built by three further scripts, needed only when photos
+or audio change:
 
 ```bash
-python build/make_spectrograms.py   # ARU clips  -> docs/media/spectrograms/
-python build/make_photos.py         # jpgs       -> docs/media/photos/ (EXIF stripped)
-python build/make_media_json.py     # captions   -> docs/data/media.json
+python build/make_photos.py        # jpgs  -> docs/media/photos/ (EXIF stripped)
+python build/make_spectrograms.py  # clips -> docs/media/spectrograms/ + audio/
+python build/make_media_json.py    # captions -> docs/data/media.json
+python build/build_summaries.py    # again, so the manifest picks up media counts
 ```
 
-`make_photos.py` strips EXIF, which matters: 9 of the 12 source photographs
-carried Exif blocks that can include GPS coordinates and device serial numbers.
-Run it on any new image before it reaches `docs/`.
+`make_photos.py` strips EXIF by rebuilding each image pixel-by-pixel, which
+matters: camera-trap files can carry GPS and device serials. Run it on any new
+image before it reaches `docs/`.
 
-## Tracking BirdNET validation progress
+## BirdNET confidence cutoffs
 
-**150 recordings are validated per species**, drawn *stratified across
-confidence bins*. A logistic regression of true-positive outcome on BirdNET
-confidence then gives the cutoff where P(true positive) = 0.95; detections at
-or above that cutoff are the positives carried into the multi-species occupancy
-model. Total workload: **11,730 validations** across 84 species. It currently
-reads 0%.
+For each species, 150 detections were reviewed by ear and the lowest confidence
+at which 95% of them were true positives was recorded in
+`data/Bird_Frog_Audio_Summaries/BirdNet_Thresholds.csv`. The pipeline applies
+each cutoff to its own species and splits the 80 BirdNET labels into four
+states, which the dashboard keeps separate rather than averaging:
 
-To record progress, edit **`build/validation_log.csv`**. It has one row per
-species per confidence bin (641 rows), and you fill in two columns:
+| Group | n species | What is shown |
+|---|---|---|
+| Validated birds | 47 | only detections at or above that species' cutoff |
+| No attainable cutoff | 5 | raw detections, flagged; 95% was never reached at any confidence, so the log carries a nominal 1.0 |
+| Frogs and toads | 11 | raw detections, unvalidated |
+| Birds awaiting validation | 12 | raw detections, unvalidated |
 
-| column | meaning |
-|---|---|
-| `n_checked` | how many detections **in that confidence bin** you have listened to |
-| `n_true_positive` | how many of those were genuinely that species |
+Plus 5 anthropogenic and domestic labels (engine, gunshot, human, dog), kept
+visible on the validation table and excluded from every species and activity
+figure.
 
-Everything else (`confidence_bin`, `n_available`, `target`) is regenerated and
-can be left alone; `notes` is yours. Counts you have entered are preserved
-across rebuilds, keyed on species + bin, so re-running the pipeline after new
-BirdNET output never discards validation work.
+Filtering is not cosmetic: across the 47 validated species it keeps 1,740,770
+of 2,637,897 raw detections — 66%. Cutoffs run from 0.25 to 0.95 with a median
+of 0.44, and ten species sit at the 0.25 floor.
 
-### Why stratified, and what that costs
+To add a cutoff, fill in the `Threshold` column for that species and re-run the
+pipeline. A species with a blank threshold and class `Amphibia` lands in the
+frog group; blank and `Aves` lands in the queue. Nothing is inferred beyond
+that, and a label with no row in the file at all is excluded from every figure
+and reported under "Known data gaps".
 
-Raw confidences are concentrated near the 0.25 floor (median 0.43, 25th
-percentile 0.28). A simple random 150 would therefore put almost nothing near
-the crossing point — for pickerel frog, about *one* of 150 draws would land at
-or above 0.90, and for Swainson's warbler 130 of 150 would fall below 0.40. The
-0.95 cutoff would be extrapolated rather than estimated.
+### Why the per-species listening rate is not a precision figure
 
-Allocating roughly 19 validations to each of eight bins from 0.25 to 1.0 puts
-data on both sides of the crossing. The cost is that **validated detections are
-no longer a random sample**, so the pooled true-positive rate over your
-validated clips is *not* the precision of the dataset. The dashboard therefore
-reports per-stratum rates and the fitted curve, and deliberately publishes no
-"overall precision" figure. The fitted curve is the object of interest, which
-is what the threshold approach needs anyway.
+The table reports, per species, the share of reviewed clips that were genuinely
+that species. That describes **the clips that were listened to**, which were
+chosen to locate each cutoff — not a random sample of the species' detections.
+It is validation effort, not the precision of the published counts, and is
+labelled that way everywhere it appears. No pooled "overall precision" number
+is published anywhere on the site.
 
-A cutoff appears only once a species has validations in **at least two**
-confidence bins. Until then the table reads "not started". Where the fit runs
-but cannot identify a cutoff — precision not increasing with confidence, or
-0.95 never reached inside the confidence range — the table says "not
-identifiable" and the reason is in the tooltip and in `species[].fit.reason`.
-No number is invented in those cases.
+## Activity curves
 
-### Tuning the design
+Half-hour histograms of detection time are smoothed with a **wrapped** Gaussian
+kernel (σ = 1.4 bins ≈ 42 min) and scaled so each curve integrates to 1 over
+the 24-hour cycle. Wrapping matters: a detection at 23:50 is twenty minutes
+from one at 00:10, and a non-circular smoother would invent a trough at
+midnight. Scaling to unit area makes curve **shapes** comparable between plot
+types with very different totals; the totals themselves are printed beside the
+chart and in every hover.
 
-Near the top of `build_summaries.py`:
+Shaded bands are 95% intervals from propagating Poisson counts through the same
+kernel. They are the honest brake on over-reading a single-species curve: pick
+a taxon with thirty detections and the band is wider than the curve.
 
-| constant | effect |
-|---|---|
-| `VALIDATION_N_PER_SPECIES` | validations per species (currently 150) |
-| `VALIDATION_TARGET_P` | target true-positive probability (currently 0.95) |
-| `VALIDATION_BIN_EDGES` | the confidence strata |
-| `VALIDATION_POOL_THRESHOLD` | the retained-detection floor (currently 0.25) |
+**The ARU curves are effort-corrected and the camera curves are not**, which is
+not an inconsistency. Cameras ran continuously, so every half-hour of the clock
+got equal watching and the denominator cancels. The ARU schedule does not:
+roughly 1,800 five-minute recordings per hour through the night, a 60-minute
+recording over the dawn chorus, and only about 65 recordings *all season* for
+each midday hour. A raw histogram of BirdNET detection times would therefore
+show a dawn spike and an empty afternoon that are mostly an artefact of when
+the recorders were on. The acoustic panel plots detections per recording-hour,
+reconstructed from all 29,096 recording files.
 
-Changing bin edges rewrites the log's row set. Counts are matched on the bin
-label, so **keep a copy of the log before changing the edges** — rows whose
-label no longer exists are dropped.
+Recording length is inferred per file from the largest detection offset it
+contains. The two scheduled lengths separate cleanly — no file in the dataset
+has a maximum offset between 300 and 310 s — so the inference is safe; the
+residual error is a 60-minute file whose only detections fell in its first few
+minutes, which would be scored short and slightly under-state effort in that
+bin.
 
-## Adding the bat and vegetation views
+## Detection rate and naive occupancy
 
-Both already appear in the toggle as "planned" with a description of the pending
-work. To activate one:
+Back-to-back bars, one pair per taxon: naive occupancy on a reversed left axis,
+detection rate on the right. The two are deliberately **not** combined into an
+index. Occupancy is how widespread a taxon is; rate is how often it was
+recorded per unit effort. A taxon can be everywhere but rarely, or
+concentrated but prolific, and keeping both visible is the point.
 
-1. Add the raw export under `raw_data/`.
-2. Add a `build_bats()` / `build_vegetation()` function to
-   `build/build_summaries.py` that writes `docs/data/bats.json` (follow the
-   shape of `birdnet.json`) or `docs/data/vegetation.json`.
-3. In the `views` list near the bottom of `main()`, change that view's
-   `"status"` from `"pending"` to `"available"` and fill in its counts.
-4. For a species chart, add the view id to the species-file mapping in
-   `docs/assets/js/charts.js`.
+The site unit differs by sensor and the chart says which it is using:
 
-The toggle, headline stats and pending states are all generated from
-`manifest.json`, so steps 1–3 are usually the whole job. Adding a sixth view is
-a pipeline change, not an HTML change.
+| View | Site | Effort denominator |
+|---|---|---|
+| Bucket cameras | plot (50) | 8,979 hut-days over 5,582 array-days |
+| Parallel cameras | camera station (151) | 5,967 camera-days |
 
-## Publishing to GitHub Pages
+An AHDriFT array is one or two camera huts at a plot, so rate is per hut-day:
+a plot that ran one hut is not credited with two huts' worth of opportunity.
+Parallel cameras are independent stations, three to six per plot, so occupancy
+is over stations rather than plots.
 
-The repository is already initialized and committed. To publish:
+Naive occupancy is an **observed proportion, uncorrected for imperfect
+detection** — a floor on true occupancy, not an estimate of it. That is what
+the multi-species occupancy model is for.
 
-**1. Create an empty repository on GitHub.** Do not add a README, license, or
-`.gitignore` — this repo has its own. Note whether it is public or private
-(Pages on a private repo requires a paid plan).
+The acoustic view carries no rate chart. Recording hours are not comparable to
+trap-days, and a plot-level "occupancy" built from unvalidated classifier hits
+would not mean what the figure implies.
 
-**2. Add the remote and push:**
+## Map popups
 
-```bash
-cd /home/will/NCSU/Claude_Science/2026_Sensor_Dashboard
-git remote add origin https://github.com/harrodw/Timbermill_Data_Dashboard.git
-git branch -M main
-git push -u origin main
-```
+Hovering a marker lists the species recorded by that sensor and how many times;
+clicking pins the full list, which for an ARU plot runs to sixty-odd rows and
+scrolls.
 
-**3. Enable Pages.** In the repository on GitHub: **Settings → Pages**. Under
-"Build and deployment" set Source to **Deploy from a branch**, then branch
-**main** and folder **`/docs`**. Save.
+The three streams resolve to different spatial units and the popup labels which
+one it is using. Parallel-camera sequences belong to the individual camera
+station. The cleaned AHDriFT table and the BirdNET output are both recorded at
+the plot — there is exactly one AHDriFT array and one ARU per plot, so nothing
+is lost, but the popup still says "the AHDriFT array at plot IF01" rather than
+implying a point-level tally.
 
-**4. Wait about a minute**, then visit
-`https://<your-username>.github.io/<repo-name>/`.
+## Photo album
 
-Subsequent updates are just:
+One photograph per reptile and amphibian taxon, plus the mammal frames the
+album already carried. Black bear keeps three: a bear filling a bucket mouth
+and a sow with cubs crossing a thinned stand are different photographs of
+different things.
 
-```bash
-python build/build_summaries.py
-git add -A
-git commit -m "Update summaries"
-git push
-```
+The reptile and amphibian photos are filed one directory per taxon under
+`data/AHDriFT_Photos/`, with Wildlife Insights export filenames carrying the
+image UUID. That UUID is the join key into `images_2011183.csv`, so every
+caption's species, plot, schedule and timestamp comes from the Wildlife
+Insights identification **of that exact frame** rather than from the directory
+name. This is load-bearing: one file filed under `T.saurita/` is identified in
+Wildlife Insights as a common gartersnake (*Thamnophis sirtalis*), not a ribbon
+snake, and the album follows the identification. Six hand-exported originals
+have no image record to join against; their identification is the researcher's
+own and is labelled as such in the lightbox.
 
-Pages redeploys automatically on push.
+Several directory names carry a trailing space (`A.terestris/`), which is
+invisible in a listing. `make_photos.py` resolves each selection by filename
+when its literal path does not exist, so the album does not break on that.
 
-### Before you push — a 20-second check
+Twenty-one of the twenty-seven published frames carry a Wildlife Insights
+identification, out of 76 candidates on disk. To change a selection, edit
+`PICKS` in `build/make_photos.py` and re-run the three media scripts.
 
-```bash
-git status --porcelain          # should list nothing from raw_data/ or private/
-git ls-files | grep -c raw_data # must print 0
-```
+Ten of the album's reptile and amphibian frames show a taxon that does **not**
+appear in the cleaned motion-capture table: copperhead, wormsnake, ring-necked
+snake, DeKay's brownsnake, ribbonsnake, gartersnake, broadhead skink,
+salamander, spotted turtle, and one snake identified only to Squamata.
 
-The `.gitignore` handles this, but the data is unpublished and the check is
-cheap.
+Seven of the ten came from the time-lapse schedule, which the cleaned table
+does not cover, so their absence is expected. The spotted turtle is a
+hand-exported original with no Wildlife Insights record at all. The remaining
+two are **motion-capture** frames, which the cleaned table does cover:
+broadhead skink, whose records the cleaned list carries one rank up as
+`Plestiodon Species`, and ring-necked snake, which the cleaned list has no
+entry for at any rank. Since that table is your final species set — "only the
+species I care about" — the ring-necked snake is presumably a deliberate
+exclusion rather than a gap, but it is the one case where a motion-capture
+photograph shows an animal the detection data does not acknowledge, and worth
+a glance.
 
-### Sharing the link
-
-The site sets `noindex, nofollow`, so search engines will not list it — but a
-public repository is still public to anyone with the URL. For sharing with Apex,
-TNC, or conference attendees that is usually what you want. If you need it
-genuinely restricted, use a private repository with Pages on a paid plan.
+The album states the absence on each tile rather than letting a missing count
+read as a zero.
 
 ## What the numbers mean
 
-Two different counting units appear on the dashboard and they are not
-comparable:
+Three counting units appear and none are interchangeable:
 
-- **Wildlife Insights sequences** — an identification unit (a burst of images of
-  one species at one camera), not a count of individual animals. Only
-  human-reviewed sequences are counted; the remainder carry MegaDetector output
-  awaiting expert review. Vehicle and blank sequences are excluded.
-- **BirdNET detections** — raw classifier hits on 3-second windows, with no
-  validation. These are not verified occurrences and include false positives at
-  an unknown rate. That rate is exactly what the validation workflow above
-  measures.
+- **AHDriFT detection events** — one motion-capture sequence of one taxon at
+  one array, identified by the researcher. Identification is complete for the
+  season, and plot-days with no detection are recorded explicitly, so these
+  counts are complete rather than in progress. Events are counted as rows:
+  the export carries 0 in both `n.Seq` and `Max.Group.Size` for every row, so
+  neither a sequence count nor a group size is used anywhere.
+- **Wildlife Insights sequences** — an identification unit (a burst of images
+  of one species at one camera), not a count of individual animals. Vehicle,
+  blank, human and coarse-group labels are excluded from the species charts and
+  counted separately. Labels above genus (`Passeriformes Order`,
+  `Cathartidae Family`) are excluded by rank; genus-level labels
+  (`Corvus Species`) are kept, because they are the same kind of unit as the
+  cleaned AHDriFT list's `Plestiodon Species`.
+- **BirdNET detections** — classifier hits on 3-second windows. Validated
+  species are filtered to their own cutoff; every other group is raw, and the
+  group selector says which.
 
-Neither is corrected for survey effort, which differs substantially among
-sensors — the effort chart shows how much. Sensor-day totals exclude
-zero-length and disrupted deployments, so they run slightly below the raw
-counts in the TNC progress report. AHDriFT arrays log a motion-capture and a
-time-lapse schedule for the same physical camera; these are collapsed so effort
-is not double counted.
+Raw counts are not corrected for survey effort, which differs substantially
+among sensors — the effort chart shows how much. The rate chart is corrected;
+the activity panel is corrected for the ARUs.
 
 ## Map coordinates are deliberately wrong
 
@@ -223,54 +277,131 @@ Published sensor positions are displaced 41–165 m (median 94 m) from their tru
 locations along a fixed pseudo-random bearing, then rounded to three decimal
 places. This is intentional: the sensors sit on private industrial forest land
 and the detections include species of conservation concern. The offset is
-deterministic, so markers do not move between rebuilds, and 229 sensor points
-collapse to 178 distinct published positions.
+deterministic, so markers do not move between rebuilds.
 
-Full-precision coordinates stay in `raw_data/`, which is git-ignored. Do not
-"fix" the map by publishing the real coordinates.
+Full-precision coordinates stay in `data/`, which is git-ignored. Do not "fix"
+the map by publishing the real coordinates.
 
 ## Known data gaps
 
-The dashboard surfaces these rather than hiding them; see `data_gaps` in
-`manifest.json`.
+Published in the page footer, not hidden; see `data_gaps` in `manifest.json`.
 
-- **ARU plot IF10** has 8 recording days in the BirdNET output (1–8 March 2026)
+- **ARU plot IF10** has 7 recording days in the BirdNET output (2–8 March 2026)
   but no entry in `cam_trap_locations_info.csv` and no Wildlife Insights
-  deployment, so it cannot be mapped. Its detections still appear in the species
-  and effort panels. Worth checking whether this plot was retired early or is
-  simply missing from the location table.
-- **`gartersnake.jpg`** is filed under `raw_data/CT_photos/` but is
-  unmistakably an AHDriFT bucket interior, so it is presented under the bucket
-  camera view. Worth correcting at the source.
-- **`Spottie!.jpg`** is a spotted turtle (*Clemmys guttata*), not a spotted
-  skunk, and is captioned accordingly.
+  deployment, so it cannot be mapped. Its detections still appear in the
+  species, activity and effort panels. Worth checking whether this plot was
+  retired early or is simply missing from the location table.
+- **IF09-CT01 and TE02-CT04** have Wildlife Insights deployments but no row in
+  the location table, so they contribute effort and detections but no marker.
+- **Tree Frog Species** is the one reptile or amphibian in the cleaned AHDriFT
+  table with no photograph in the album.
 - **Audio clips carry no plot or date.** The five example clips are named for
-  the species they contain (`pine_warbler.wav`), and that identification —
-  yours, made by listening — is what the panel shows. But unlike the earlier
-  `SMM2-<unit>_<date>_<time>` exports, these filenames carry no recorder, plot
-  or timestamp, and the files hold no embedded metadata, so no location or date
-  is attributed to a clip. The context shown beside each is season-wide for the
-  species, labelled as such. Re-exporting with the recorder and timestamp in
+  the species they contain, and that identification — yours, made by listening
+  — is what the panel shows. The filenames carry no recorder, plot or
+  timestamp and the files hold no embedded metadata, so no location or date is
+  attributed to a clip; the context shown beside each is season-wide for the
+  species and labelled as such. Re-exporting with the recorder and timestamp in
   the filename would let the panel name the plot and date again.
 
-  The species names are cross-checked against `birdnet.json` at build time: an
-  unrecognized filename is reported and skipped rather than published without a
-  Latin name. To add a clip, drop the WAV in `raw_data/Audio_Data/` and add its
+  Species names are cross-checked against `birdnet.json` at build time: an
+  unrecognized filename is reported and skipped rather than published without
+  a Latin name. To add a clip, drop the WAV in `data/Audio_Data/` and add its
   filename stem to `CLIP_SPECIES` in `build/make_spectrograms.py`.
 
-## Verification scripts
+## Verification
 
-`private/` holds the harnesses used to check the build (git-ignored, reusable
-after any rebuild):
+`private/` holds the harnesses (git-ignored, reusable after any rebuild):
 
 ```bash
-node private/frontend_check.mjs        # 166 assertions against the real JSON
-cd docs && python3 -m http.server 8000 # then open http://localhost:8000/
-python3 private/shot.py http://localhost:8000/ private/shots bucket_camera
+node private/frontend_check.mjs              # 1,635 assertions against the real JSON
+cd docs && python3 -m http.server 8000 &     # then:
+python3 private/shots.py http://localhost:8000/ private/shots_new
 ```
 
-Rendering was verified in headless Firefox only. A quick pass in Chrome or
-Safari before the October Wind Wildlife Research Meeting would be prudent.
+`frontend_check.mjs` runs the dashboard's own selector functions against the
+published summaries and checks the things a glance at the page cannot: that
+every activity curve integrates to 1, that per-plot-type counts sum to each
+taxon's total, that occupancy equals sites-detected over sites, that rate equals
+count over effort, that map popup tallies reconcile with the species files, that
+filtering never increases a count, and that every herp taxon is either in the
+album or declared a gap. It stages the ES modules into `private/.jscheck/` so
+Node reads them as modules without a `package.json` being published in `docs/`.
+
+`shots.py` renders all three views in headless Firefox, forces lazy images to
+load, opens a map popup on each view, exercises the class and species filters,
+and prints a JSON probe of what actually rendered — element visibility, Plotly
+trace counts, image load state, error slots. A panel that renders blank is
+caught by the numbers rather than only by eye.
+
+Rendering was verified in headless Firefox only. A pass in Chrome or Safari
+before the next meeting would be prudent.
+
+## Publishing to GitHub Pages
+
+**This is already set up.** The remote is
+`https://github.com/harrodw/Timbermill_Data_Dashboard.git`, the branch is
+`main`, and Pages serves the `/docs` folder at
+<https://harrodw.github.io/Timbermill_Data_Dashboard/>. Publishing an update is
+commit and push; none of the one-time setup needs repeating.
+
+### Updating the live site
+
+```bash
+cd /home/will/NCSU/Claude_Science/2026_Sensor_Dashboard
+
+# 1. rebuild (see "Rebuilding" above for when the media scripts are needed too)
+python build/build_summaries.py
+
+# 2. check nothing private is staged — the only step worth not skipping
+git status --porcelain | grep -E '^\?\? (data|private)/' || echo "clean"
+git ls-files | grep -cE '^(data|private)/'        # must print 0
+
+# 3. commit and push
+git add -A
+git commit -m "Describe what changed"
+git push
+```
+
+Pages redeploys automatically on push and takes about a minute. A hard reload
+(Ctrl/Cmd-Shift-R) clears the old JSON out of the browser cache if the numbers
+look stale.
+
+### If git asks who you are
+
+`user.name` and `user.email` are not currently set in this clone, so
+`git commit` will stop with *"Please tell me who you are."* The three existing
+commits were authored as `Will Harrod <wdharrod@ncsu.edu>`; to keep the history
+consistent:
+
+```bash
+git config user.name  "Will Harrod"
+git config user.email "wdharrod@ncsu.edu"
+```
+
+Without `--global` this applies to this repository only.
+
+### Authentication
+
+Pushing over HTTPS needs a GitHub personal access token as the password (an
+account password will be rejected). If the push prompts and fails, either
+create a token with `repo` scope under **GitHub → Settings → Developer
+settings → Personal access tokens**, or switch the remote to SSH:
+
+```bash
+git remote set-url origin git@github.com:harrodw/Timbermill_Data_Dashboard.git
+```
+
+### If Pages ever needs re-pointing
+
+**Settings → Pages**, Source **Deploy from a branch**, branch **main**, folder
+**`/docs`**.
+
+### Sharing the link
+
+The site sets `noindex, nofollow`, so search engines will not list it — but a
+public repository is still public to anyone with the URL. For sharing with
+Apex, TNC, or conference attendees that is usually what you want. If you need
+it genuinely restricted, use a private repository with Pages on a paid plan.
 
 ## Credits
 

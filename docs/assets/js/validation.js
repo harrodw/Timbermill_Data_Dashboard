@@ -1,71 +1,99 @@
 /* ==========================================================================
-   validation.js -- BirdNET validation progress (bird_frog_audio only).
+   validation.js -- two panels.
 
-   Source: data/birdnet.json .validation (overall) and .species[] per-species
-   fields. The design is a stratified sample of n per species across confidence
-   bins, with a logistic fit of P(true positive) on confidence giving the
-   cutoff at which P reaches the target; detections at or above it are the
-   positives carried into the occupancy model.
+   1. BirdNET validation (bird_frog_audio only), from birdnet.json .validation,
+      .groups[] and .species[].validation. The design is: listen to 150 clips
+      per species, record the confidence at which 95% of detections are true
+      positives, then keep only detections at or above that species' own
+      cutoff. Four states exist and the table reports which one each species
+      is in -- a cutoff, no attainable cutoff, or not reviewed yet.
 
-   Two labelling rules matter here. (1) The validated sample is stratified, not
-   random, so the pooled true-positive rate over validated clips is a property
-   of the sample and must never be titled "precision" -- per-stratum rates and
-   the fitted curve are the interpretable quantities. (2) A species with no
-   identifiable cutoff shows why, not a blank or an invented number.
+   2. Identification and validation effort, from manifest.identification_progress,
+      shown on every view.
+
+   One labelling rule runs through both. The share of listened clips that were
+   true positives is a property of the clips that were listened to -- they were
+   chosen to locate each cutoff, not drawn at random -- so it is never titled
+   "precision" and never presented as a property of the published counts.
    ========================================================================== */
 
-import { $, el, clear, fmtInt, fmtNum, fmtPct, showPanelError, hidePanelError } from './data.js';
+import {
+  $, el, clear, fmtInt, fmtNum, fmtPct, isNum, classLabel, classRank,
+  showPanelError, hidePanelError
+} from './data.js';
+
+const GROUP_BADGE = {
+  validated: 'ok',
+  no_cutoff: 'warn',
+  frogs: 'pending',
+  pending: 'pending',
+  other: 'muted'
+};
 
 const COLUMNS = [
-  { key: 'name',             label: 'Species',        text: true },
-  { key: 'klass',            label: 'Class',          text: true },
-  { key: 'n_detections',     label: 'Detections' },
-  { key: 'validation_target',label: 'Target' },
-  { key: 'n_validated',      label: 'Validated' },
-  { key: 'pct_of_target',    label: '% of target' },
-  { key: 'cutoff',           label: 'Fitted cutoff' },
-  { key: 'n_retained',       label: 'Positives retained' }
+  { key: 'name', label: 'Species', text: true },
+  { key: 'klass', label: 'Class', text: true },
+  { key: 'state', label: 'Validation state', text: true },
+  { key: 'threshold', label: 'Cutoff' },
+  { key: 'n_listened', label: 'Clips heard' },
+  { key: 'n_positive', label: 'True positives' },
+  { key: 'sample_rate', label: 'Of clips heard' },
+  { key: 'n_raw', label: 'Raw detections' },
+  { key: 'n_kept', label: 'Kept' },
+  { key: 'pct_retained', label: '% kept' }
 ];
 
-let sortKey = 'n_detections';
+let sortKey = 'n_raw';
 let sortDir = -1;
 let boundHead = false;
+let currentRows = [];
 
-/** Rows for the table: wildlife species that carry a validation target. */
+/** One table row per species label, whatever validation state it is in. */
 export function validationRows(birdnet) {
   const species = (birdnet && Array.isArray(birdnet.species)) ? birdnet.species : [];
-  return species
-    .filter(s => s.class && s.class !== 'Anthropogenic')
-    .map(s => ({
+  const groups = new Map(((birdnet && birdnet.groups) || []).map(g => [g.id, g]));
+  return species.map(s => {
+    const v = s.validation || {};
+    const g = groups.get(s.group);
+    return {
       name: s.species,
       latin: s.latin_name,
       klass: s.class,
-      n_detections: num(s.n_detections),
-      pool_size: num(s.pool_size),
-      validation_target: num(s.validation_target),
-      n_validated: num(s.n_validated),
-      n_true_positive: num(s.n_true_positive),
-      pct_of_target: num(s.pct_of_target),
-      cutoff: (s.cutoff === null || s.cutoff === undefined) ? null : Number(s.cutoff),
-      n_retained: (s.n_retained_positives === null || s.n_retained_positives === undefined)
-        ? null : Number(s.n_retained_positives),
+      group: s.group,
+      state: g ? g.status : '\u2014',
+      group_label: g ? g.label : s.group,
+      threshold: (s.threshold === null || s.threshold === undefined)
+        ? null : Number(s.threshold),
+      n_listened: num(v.n_listened),
+      n_positive: num(v.n_positive),
+      n_negative: num(v.n_negative),
+      n_skipped: num(v.n_skipped),
+      sample_rate: (v.sample_positive_rate === null || v.sample_positive_rate === undefined)
+        ? null : Number(v.sample_positive_rate),
+      n_raw: num(s.n_detections_raw),
+      n_kept: num(s.n_detections),
       pct_retained: (s.pct_retained === null || s.pct_retained === undefined)
         ? null : Number(s.pct_retained),
-      // Why a cutoff is absent, when the fit ran but could not identify one.
-      fit_reason: (s.fit && s.fit.reason) ? String(s.fit.reason) : null,
-      strata: Array.isArray(s.strata) ? s.strata : []
-    }));
+      filtered: !!s.filtered,
+      reviewer_note: v.note || null
+    };
+  });
 }
 
 function num(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
 
 export function sortRows(rows, key, dir) {
-  const col = COLUMNS.find(c => c.key === key) || COLUMNS[2];
+  const col = COLUMNS.find(c => c.key === key) || COLUMNS[7];
   return rows.slice().sort((a, b) => {
-    const av = a[col.key], bv = b[col.key];
+    const av = a[col.key];
+    const bv = b[col.key];
+    if (col.key === 'klass') {
+      return dir * (classRank(av) - classRank(bv)) ||
+        String(a.name).localeCompare(String(b.name));
+    }
     if (col.text) return dir * String(av ?? '').localeCompare(String(bv ?? ''));
-    const an = av === null ? -Infinity : Number(av);
-    const bn = bv === null ? -Infinity : Number(bv);
+    const an = (av === null || av === undefined) ? -Infinity : Number(av);
+    const bn = (bv === null || bv === undefined) ? -Infinity : Number(bv);
     return dir * (an - bn) || String(a.name).localeCompare(String(b.name));
   });
 }
@@ -104,46 +132,61 @@ function renderBody(rows) {
   }
   for (const r of sortRows(rows, sortKey, sortDir)) {
     const tr = el('tr');
+
     const nameTd = el('td', 'txt');
     nameTd.appendChild(el('span', null, r.name));
     if (r.latin) {
       nameTd.appendChild(document.createTextNode(' '));
       nameTd.appendChild(el('span', 'latin', r.latin));
     }
+    if (r.reviewer_note) {
+      const flag = el('span', 'note-flag', ' \u2709');
+      flag.title = `Reviewer note: ${r.reviewer_note}`;
+      nameTd.appendChild(flag);
+    }
     tr.appendChild(nameTd);
-    tr.appendChild(el('td', 'txt', r.klass || '\u2014'));
-    tr.appendChild(el('td', null, fmtInt(r.n_detections)));
-    tr.appendChild(el('td', null, fmtInt(r.validation_target)));
-    tr.appendChild(el('td', r.n_validated ? null : 'nil', fmtInt(r.n_validated)));
-    tr.appendChild(el('td', r.pct_of_target ? null : 'nil', fmtPct(r.pct_of_target)));
+    tr.appendChild(el('td', 'txt', classLabel(r.klass)));
 
-    // A cutoff exists only once the fit identifies one. Until then say which
-    // state we are in -- not started, or fitted-but-unidentifiable and why.
-    if (r.cutoff !== null) {
-      tr.appendChild(el('td', null, fmtNum(r.cutoff, 3)));
-    } else if (r.fit_reason) {
-      const td = el('td', 'nil', 'not identifiable');
-      td.title = r.fit_reason;
+    const stateTd = el('td', 'txt');
+    const badge = el('span', `state-badge ${GROUP_BADGE[r.group] || 'muted'}`, r.state);
+    badge.title = r.group_label;
+    stateTd.appendChild(badge);
+    tr.appendChild(stateTd);
+
+    // A cutoff exists only where listening found one. The two ways it can be
+    // absent are different facts and are shown as different words.
+    if (r.threshold !== null) {
+      tr.appendChild(el('td', null, fmtNum(r.threshold, 2)));
+    } else if (r.group === 'no_cutoff') {
+      const td = el('td', 'nil', 'none found');
+      td.title = 'Listening found no confidence at which 95% of detections ' +
+        'were true positives.';
       tr.appendChild(td);
     } else {
-      tr.appendChild(el('td', 'nil', r.n_validated ? 'not yet fitted' : 'not started'));
+      tr.appendChild(el('td', 'nil', 'not reviewed'));
     }
 
-    if (r.n_retained !== null) {
-      const td = el('td', null, fmtInt(r.n_retained));
-      if (r.pct_retained !== null) {
-        td.appendChild(document.createTextNode(' '));
-        td.appendChild(el('span', 'latin', `(${fmtPct(r.pct_retained)})`));
-      }
-      tr.appendChild(td);
+    tr.appendChild(el('td', r.n_listened ? null : 'nil', fmtInt(r.n_listened)));
+    tr.appendChild(el('td', r.n_listened ? null : 'nil',
+      r.n_listened ? fmtInt(r.n_positive) : '\u2014'));
+    tr.appendChild(el('td', r.sample_rate === null ? 'nil' : null,
+      r.sample_rate === null ? '\u2014' : fmtPct(100 * r.sample_rate, 0)));
+    tr.appendChild(el('td', null, fmtInt(r.n_raw)));
+
+    if (r.filtered) {
+      tr.appendChild(el('td', null, fmtInt(r.n_kept)));
+      tr.appendChild(el('td', null, fmtPct(r.pct_retained, 0)));
     } else {
-      tr.appendChild(el('td', 'nil', '\u2014'));
+      const a = el('td', 'nil', fmtInt(r.n_kept));
+      a.title = 'No cutoff applied: raw count.';
+      tr.appendChild(a);
+      tr.appendChild(el('td', 'nil', 'unfiltered'));
     }
     body.appendChild(tr);
   }
 }
 
-function bindHead(rows) {
+function bindHead() {
   const head = $('#validation-head');
   if (!head || boundHead) return;
   boundHead = true;
@@ -151,9 +194,12 @@ function bindHead(rows) {
     const th = target.closest ? target.closest('th') : null;
     if (!th || !th.dataset.key) return;
     if (sortKey === th.dataset.key) sortDir = -sortDir;
-    else { sortKey = th.dataset.key; sortDir = COLUMNS.find(c => c.key === sortKey).text ? 1 : -1; }
+    else {
+      sortKey = th.dataset.key;
+      sortDir = COLUMNS.find(c => c.key === sortKey).text ? 1 : -1;
+    }
     renderHead();
-    renderBody(rows);
+    renderBody(currentRows);
   };
   head.addEventListener('click', (ev) => act(ev.target));
   head.addEventListener('keydown', (ev) => {
@@ -169,6 +215,8 @@ function stat(label, value, sub) {
   return box;
 }
 
+/* ------------------------------------------------- BirdNET validation panel */
+
 export function renderValidation(ctx) {
   const panel = $('#panel-validation');
   if (!panel) return;
@@ -180,111 +228,144 @@ export function renderValidation(ctx) {
 
   if (!birdnet) {
     showPanelError('#validation-error', 'Validation progress unavailable.',
-      'data/birdnet.json could not be loaded, so validation progress cannot be shown.');
+      'data/birdnet.json could not be loaded, so validation state cannot be shown.');
     clear($('#validation-body'));
     return;
   }
 
   const v = birdnet.validation || {};
-  const pct = Number(v.pct_complete);
-  const pctSafe = Number.isFinite(pct) ? pct : 0;
-  const notStarted = !Number.isFinite(pct) || pct <= 0;
+  const groups = Array.isArray(birdnet.groups) ? birdnet.groups : [];
 
   const sub = $('#validation-sub');
   if (sub) {
-    const nPer = Number(v.n_per_species);
-    const tp = Number(v.target_p);
     sub.textContent =
-      (Number.isFinite(nPer)
-        ? `${fmtInt(nPer)} detections are validated per species, spread across confidence strata. `
-        : 'Manual verification of BirdNET detections. ') +
-      (Number.isFinite(tp)
-        ? `A logistic regression of true-positive outcome on BirdNET confidence gives the cutoff ` +
-          `where P(true positive) reaches ${fmtNum(tp, 2)}; detections at or above it become the ` +
-          `positives for the occupancy model. `
-        : '') +
-      `Every count in the species chart is unvalidated until this table fills in.`;
+      `${fmtInt(v.n_listened_per_species)} detections were reviewed by ear per species, ` +
+      `and the confidence at which ${fmtPct(100 * Number(v.target_p), 0)} of them were ` +
+      `true positives was recorded as that species' cutoff. Each species is then ` +
+      `filtered to its own cutoff. Species without one are shown raw and are labelled ` +
+      `as such everywhere on this page.`;
   }
 
-  // progress bar
-  const wrap = el('div', 'progress-wrap');
-  const lab = el('div', 'progress-label');
-  lab.appendChild(el('span', null, 'Detections validated against target'));
-  const state = el('span', notStarted ? 'state notstarted' : 'state',
-    notStarted
-      ? `Not started \u2014 0 of ${fmtInt(v.n_target)} (0.0%)`
-      : `${fmtInt(v.n_validated)} of ${fmtInt(v.n_target)} (${fmtPct(pctSafe)})`);
-  lab.appendChild(state);
-  wrap.appendChild(lab);
-  const track = el('div', 'progress-track');
-  const fill = el('div', 'progress-fill');
-  fill.style.width = `${Math.max(0, Math.min(100, pctSafe))}%`;
-  track.appendChild(fill);
-  wrap.appendChild(track);
-  if (notStarted) {
-    wrap.appendChild(el('p', 'progress-empty-note',
-      'No detections have been reviewed yet. The bar and the per-species columns below fill in ' +
-      'as rows are added to build/validation_log.csv and the summaries are rebuilt.'));
+  overall.appendChild(stat('Clips reviewed', fmtInt(v.n_clips_listened),
+    `${fmtInt(v.n_clips_positive)} true, ${fmtInt(v.n_clips_negative)} false, ` +
+    `${fmtInt(v.n_clips_skipped)} skipped`));
+  // isNum: cutoff_median is null until at least one species is validated, and
+  // Number(null) is a finite 0 that would print "median 0.00".
+  overall.appendChild(stat('Cutoffs established', fmtInt(v.n_species_validated),
+    isNum(v.cutoff_median)
+      ? `median ${fmtNum(v.cutoff_median, 2)}, range ${fmtNum(v.cutoff_min, 2)}\u2013${fmtNum(v.cutoff_max, 2)}`
+      : null));
+  overall.appendChild(stat('Detections kept', fmtInt(v.n_detections_validated_retained),
+    `${fmtPct(v.pct_retained_validated, 0)} of the ` +
+    `${fmtInt(v.n_detections_validated_raw)} raw detections of those species`));
+  overall.appendChild(stat('Still unreviewed',
+    fmtInt(Number(v.n_species_frogs) + Number(v.n_species_pending)),
+    `${fmtInt(v.n_species_frogs)} anurans and ${fmtInt(v.n_species_pending)} birds ` +
+    `in the queue`));
+  if (Number(v.n_species_no_cutoff) > 0) {
+    overall.appendChild(stat('No cutoff reachable', fmtInt(v.n_species_no_cutoff),
+      'never reached the target at any confidence'));
   }
-  overall.appendChild(wrap);
 
-  const nSp = Number(v.n_species_target);
-  const nFit = Number(v.n_species_fitted);
-
-  overall.appendChild(stat('Detection pool', fmtInt(v.pool_size),
-    v.pool_threshold !== undefined ? `at confidence \u2265 ${v.pool_threshold}` : null));
-  overall.appendChild(stat('Validation target', fmtInt(v.n_target),
-    (Number.isFinite(Number(v.n_per_species)) && Number.isFinite(nSp))
-      ? `${fmtInt(v.n_per_species)} per species \u00d7 ${fmtInt(nSp)} species` : null));
-  overall.appendChild(stat('Validated', fmtInt(v.n_validated),
-    notStarted ? 'none reviewed' : null));
-
-  // Cutoffs fitted, not a pooled precision: the sample is stratified, so a
-  // pooled ratio would not be the dataset's precision.
-  overall.appendChild(stat('Cutoffs fitted',
-    Number.isFinite(nFit) && Number.isFinite(nSp)
-      ? `${fmtInt(nFit)} of ${fmtInt(nSp)}` : '\u2014',
-    Number.isFinite(nFit) && nFit > 0
-      ? `median ${fmtNum(Number(v.cutoff_median), 3)} ` +
-        `(range ${fmtNum(Number(v.cutoff_min), 3)}\u2013${fmtNum(Number(v.cutoff_max), 3)})`
-      : 'needs validated detections in \u2265 2 strata'));
-
-  if (Number.isFinite(Number(v.n_retained_positives)) && v.n_retained_positives !== null) {
-    overall.appendChild(stat('Positives retained', fmtInt(v.n_retained_positives),
-      'at or above the fitted cutoffs, for the occupancy model'));
+  // Group bars: how the detection pool divides across validation states.
+  const groupBox = $('#validation-groups');
+  if (groupBox) {
+    clear(groupBox);
+    const total = groups.reduce((a, g) => a + Number(g.n_detections_raw || 0), 0);
+    for (const g of groups) {
+      if (!g.n_species) continue;
+      const row = el('div', 'vgroup');
+      const head = el('div', 'vgroup-head');
+      head.appendChild(el('span', 'vgroup-label', g.label));
+      head.appendChild(el('span', `state-badge ${GROUP_BADGE[g.id] || 'muted'}`, g.status));
+      head.appendChild(el('span', 'vgroup-count',
+        `${fmtInt(g.n_species)} species \u00b7 ${fmtInt(g.n_detections_raw)} raw detections` +
+        (g.filtered ? ` \u00b7 ${fmtInt(g.n_detections)} kept` : '')));
+      row.appendChild(head);
+      const track = el('div', 'vgroup-track');
+      const raw = el('div', 'vgroup-raw');
+      raw.style.width = `${total ? (100 * g.n_detections_raw / total).toFixed(2) : 0}%`;
+      const kept = el('div', 'vgroup-kept');
+      kept.style.width = `${total ? (100 * g.n_detections / total).toFixed(2) : 0}%`;
+      raw.appendChild(kept);
+      track.appendChild(raw);
+      row.appendChild(track);
+      row.appendChild(el('p', 'vgroup-note', g.note));
+      groupBox.appendChild(row);
+    }
   }
 
   const note = $('#validation-note');
   if (note) {
     clear(note);
     if (v.note) note.appendChild(el('span', null, v.note));
-    // The stratification caveat is a correctness point, not a footnote: it is
-    // why no "overall precision" figure is shown anywhere on this panel.
-    if (v.sampling_note) {
-      note.appendChild(el('p', 'panel-note', v.sampling_note));
-    }
+    if (v.sampling_note) note.appendChild(el('p', 'panel-note', v.sampling_note));
   }
 
-  const rows = validationRows(birdnet);
+  currentRows = validationRows(birdnet);
   const caption = $('#validation-caption');
   if (caption) {
     caption.textContent =
-      `${fmtInt(rows.length)} wildlife species with a validation target. ` +
-      `Click any column heading to sort. "Fitted cutoff" is the confidence at which the ` +
-      `logistic fit reaches P(true positive) = ` +
-      `${Number.isFinite(Number(v.target_p)) ? fmtNum(Number(v.target_p), 2) : '0.95'}; ` +
-      `"positives retained" is how many detections sit at or above it. Both stay empty until ` +
-      `a species has validations in at least two confidence strata.`;
+      `All ${fmtInt(currentRows.length)} BirdNET labels in the dataset and the validation ` +
+      `state of each. Click any column heading to sort. "Of clips heard" is the share of ` +
+      `reviewed clips that were genuinely the species: it describes the clips that were ` +
+      `listened to, which were chosen to locate the cutoff, and is not the precision of ` +
+      `the published counts.`;
   }
   renderHead();
-  renderBody(rows);
-  bindHead(rows);
+  renderBody(currentRows);
+  bindHead();
 
   const foot = $('#validation-foot');
   if (foot) {
     foot.textContent =
-      `Progress is read from build/validation_log.csv by build/build_summaries.py; ` +
-      `the log file is ${v.log_present ? 'present' : 'missing'} in the build directory. ` +
-      `Adding reviewed detections to that file and rerunning the pipeline updates this panel.`;
+      `Cutoffs are read from data/Bird_Frog_Audio_Summaries/BirdNet_Thresholds.csv by ` +
+      `build/build_summaries.py, which carries ${fmtInt(v.n_species_in_log)} labels. ` +
+      `Adding a cutoff there and rebuilding updates every count on this view.`;
+  }
+}
+
+/* ------------------------------------------- identification effort (all views) */
+
+/**
+ * The identification and validation work behind the numbers, per sensor
+ * stream. Driven entirely by manifest.identification_progress, so adding a
+ * stream to the pipeline adds a block here with no page edit.
+ */
+export function renderIdentification(ctx) {
+  const box = $('#ident-body');
+  if (!box) return;
+  const ip = (ctx.manifest && ctx.manifest.identification_progress) || null;
+  clear(box);
+  hidePanelError('#ident-error');
+  if (!ip || !Object.keys(ip).length) {
+    showPanelError('#ident-error', 'Identification summary unavailable.',
+      'manifest.json carries no identification_progress block.');
+    return;
+  }
+
+  const activeKey = { bucket_camera: 'ahdrift', parallel_camera: 'parallel',
+    bird_frog_audio: 'birdnet' }[ctx.viewId];
+
+  for (const [key, block] of Object.entries(ip)) {
+    const card = el('section', 'ident-card' + (key === activeKey ? ' current' : ''));
+    const head = el('div', 'ident-head');
+    head.appendChild(el('h4', null, block.label));
+    if (key === activeKey) head.appendChild(el('span', 'badge', 'This view'));
+    card.appendChild(head);
+
+    const grid = el('div', 'ident-stats');
+    for (const row of (block.stats || [])) {
+      const [label, value, note] = row;
+      const cell = el('div', 'ident-stat');
+      cell.appendChild(el('div', 'stat-value',
+        Number.isFinite(Number(value)) ? fmtInt(value) : String(value ?? '\u2014')));
+      cell.appendChild(el('div', 'stat-label', label));
+      if (note) cell.appendChild(el('div', 'stat-sub', note));
+      grid.appendChild(cell);
+    }
+    card.appendChild(grid);
+    if (block.note) card.appendChild(el('p', 'panel-note', block.note));
+    box.appendChild(card);
   }
 }

@@ -12,11 +12,12 @@ import {
 } from './data.js';
 import { renderMap, invalidateMap } from './map.js';
 import {
-  renderEffort, renderSpecies, fillThresholdControl, resizeCharts,
-  effortRowsForView, aruRowsForView, effortStatsFromRows, normalizeSpecies
+  renderEffort, renderSpecies, renderActivity, renderTree, fillGroupControl,
+  resizeCharts, effortRowsForView, aruRowsForView, effortStatsFromRows,
+  normalizeSpecies, speciesSource
 } from './charts.js';
 import { renderMedia, mediaCount } from './media.js';
-import { renderValidation } from './validation.js';
+import { renderValidation, renderIdentification } from './validation.js';
 
 window.__dashboardBooted = true;
 
@@ -37,7 +38,18 @@ const state = {
   errors: {},
   media: null,
   mediaError: null,
-  controls: { topN: '25', sort: 'count_desc', stack: 'stacked', threshold: 'all' }
+  /* Each chart carries its own class filter: the species chart, the activity
+     curves and the rate-vs-occupancy chart answer different questions, and
+     wanting mammals in one does not mean wanting mammals in all three. The
+     BirdNET validation group is shared, because it selects which detections
+     exist at all for this view, not how they are displayed. */
+  controls: {
+    topN: '25', sort: 'count_desc', stack: 'stacked',
+    bnGroup: 'validated',
+    speciesClass: 'all',
+    activityClass: 'all', activitySpecies: 'all',
+    treeClass: 'all', treeTopN: '25'
+  }
 };
 
 /* ------------------------------------------------------------------- header */
@@ -104,7 +116,9 @@ function renderStats(view) {
   clear(strip);
 
   const isAru = view.id === 'bird_frog_audio';
-  const speciesList = normalizeSpecies(view, state.sources, null);
+  const isBucket = view.id === 'bucket_camera';
+  const speciesList = normalizeSpecies(view, state.sources,
+    { group: state.controls.bnGroup });
   const bn = state.sources.birdnet;
 
   // species
@@ -115,9 +129,11 @@ function renderStats(view) {
       : (speciesList ? speciesList.length : null);
   }
   strip.appendChild(statCard(
-    isAru ? 'Species (acoustic)' : 'Species identified',
+    isAru ? 'Species (acoustic)' : 'Taxa identified',
     fmtInt(nSpecies),
-    isAru ? 'wildlife classes, unvalidated' : 'excludes coarse-group labels'));
+    isAru ? 'wildlife labels across all validation states'
+      : (isBucket ? 'the researcher\u2019s final species list'
+        : 'excludes coarse-group labels')));
 
   // deployments / plots, and sensor-days -- recomputed from the plotted rows
   const rows = isAru ? aruRowsForView(bn) : effortRowsForView(state.sources.effort, view.id);
@@ -128,27 +144,40 @@ function renderStats(view) {
   const nDep = Number.isFinite(Number(view.n_deployments)) ? view.n_deployments
     : (summary ? summary.n_deployments : (derived ? derived.n_deployments : null));
   strip.appendChild(statCard(
-    isAru ? 'Recording plots' : 'Camera deployments',
+    isAru ? 'Recording plots' : (isBucket ? 'AHDriFT arrays' : 'Camera deployments'),
     fmtInt(nDep),
-    isAru ? 'one ARU per plot' : 'camera at one point, one date window'));
+    isAru ? 'one ARU per plot'
+      : (isBucket ? 'one array per plot, one or two huts each'
+        : 'camera at one station, one date window')));
 
   const days = Number.isFinite(Number(view.sensor_days)) ? view.sensor_days
     : (summary ? summary.total_sensor_days : (derived ? derived.total_sensor_days : null));
+  const rate = speciesSource(view, state.sources);
   strip.appendChild(statCard(
-    isAru ? 'Recording days' : 'Sensor-days',
+    isAru ? 'Recording days' : (isBucket ? 'Array-days reviewed' : 'Camera-days'),
     fmtDays(days),
-    derived ? `${fmtDays(Math.round(derived.mean_days * 10) / 10)} d mean per ${isAru ? 'plot' : 'deployment'}` : null));
+    (isBucket && rate && rate.rate)
+      ? `${fmtInt(rate.rate.total_hut_days)} hut-days, the rate denominator`
+      : (derived ? `${fmtDays(Math.round(derived.mean_days * 10) / 10)} d mean per ${isAru ? 'plot' : 'deployment'}` : null)));
 
   // detections / sequences
   if (isAru && bn) {
+    const v = bn.validation || {};
     strip.appendChild(statCard('Classifier detections', fmtInt(bn.n_detections_total),
-      'raw BirdNET, unvalidated'));
+      Number.isFinite(Number(v.n_detections_validated_retained))
+        ? `${fmtInt(v.n_detections_validated_retained)} kept after per-species cutoffs`
+        : 'raw BirdNET'));
   } else {
-    const src = view.speciesKind === 'ahdrift' ? state.sources.species_ahdrift : state.sources.species_parallel;
+    const src = speciesSource(view, state.sources);
     if (src) {
-      strip.appendChild(statCard('Identified sequences', fmtInt(src.n_identified_sequences),
-        Number.isFinite(src.n_coarse_sequences)
-          ? `plus ${fmtInt(src.n_coarse_sequences)} coarse or non-wildlife` : null));
+      strip.appendChild(statCard(
+        isBucket ? 'Detection events' : 'Identified sequences',
+        fmtInt(src.n_identified_sequences),
+        Number(src.n_coarse_sequences) > 0
+          ? `plus ${fmtInt(src.n_coarse_sequences)} coarse or non-wildlife`
+          : (isBucket
+            ? `${fmtInt(src.n_blank_plot_days)} plot-days recorded nothing`
+            : null)));
     }
   }
 
@@ -183,9 +212,23 @@ async function renderAvailable(view) {
 
   renderStats(view);
 
+  const isBirdnet = view.speciesKind === 'birdnet';
+
+  // BirdNET-only validation-group control. Filled before any panel renders,
+  // because the group decides which detections the other panels even see.
+  const grpWrap = $('#species-group-wrap');
+  if (grpWrap) {
+    grpWrap.hidden = !isBirdnet;
+    if (isBirdnet) {
+      state.controls.bnGroup =
+        fillGroupControl(state.sources.birdnet, state.controls.bnGroup);
+    }
+  }
+
   const ctx = {
     view,
     viewId: view.id,
+    manifest: state.manifest,
     sources: state.sources,
     locations: state.sources.locations,
     birdnet: state.sources.birdnet,
@@ -197,24 +240,42 @@ async function renderAvailable(view) {
 
   // validation panel: only where the data file defines one
   const vPanel = $('#panel-validation');
-  const wantsValidation = view.speciesKind === 'birdnet';
-  vPanel.hidden = !wantsValidation;
-  if (wantsValidation) renderValidation(ctx);
+  vPanel.hidden = !isBirdnet;
+  if (isBirdnet) renderValidation(ctx);
 
-  // BirdNET-only confidence control
-  const thWrap = $('#species-threshold-wrap');
-  if (thWrap) {
-    thWrap.hidden = view.speciesKind !== 'birdnet';
-    if (view.speciesKind === 'birdnet') fillThresholdControl(state.sources.birdnet);
+  // rate vs occupancy needs a published survey-effort denominator, which the
+  // ARU view does not have: recording hours are not comparable to trap-days
+  // and a plot-level acoustic "occupancy" of an unvalidated classifier hit
+  // would not mean what the chart implies.
+  const treeSrc = speciesSource(view, state.sources);
+  const wantsTree = !!(treeSrc && treeSrc.rate);
+  const tPanel = $('#panel-tree');
+  if (tPanel) {
+    tPanel.hidden = !wantsTree;
+    // Emptied as well as hidden: a hidden panel that keeps the previous
+    // view's caption is a trap for anyone reading the DOM, and the caption
+    // names a different site unit and a different denominator.
+    if (!wantsTree) {
+      for (const sel of ['#tree-stats', '#tree-chart']) clear($(sel));
+      setText('#tree-sub', '');
+      setText('#tree-note', '');
+    }
   }
 
   renderMedia(ctx);
-  // Render the three data panels concurrently. Sequencing them would let one
-  // slow or blocked CDN library hold up the panels behind it, including the
-  // map's coordinate-precision note, which must never be late.
+  renderIdentification(ctx);
+  // Render the data panels concurrently. Sequencing them would let one slow
+  // library load hold up the panels behind it, including the map's
+  // coordinate-precision note, which must never be late.
   await Promise.all([
     renderSpecies(ctx).catch(err => showPanelError('#species-error',
       'Species chart failed to render.', String(err && err.message || err))),
+    renderActivity(ctx).catch(err => showPanelError('#activity-error',
+      'Activity curves failed to render.', String(err && err.message || err))),
+    wantsTree
+      ? renderTree(ctx).catch(err => showPanelError('#tree-error',
+        'Detection-rate chart failed to render.', String(err && err.message || err)))
+      : Promise.resolve(),
     renderEffort(ctx).catch(err => showPanelError('#effort-error',
       'Effort chart failed to render.', String(err && err.message || err))),
     renderMap(ctx).catch(err => showPanelError('#map-error',
@@ -283,6 +344,29 @@ function renderFooter(manifest) {
     'Camera identifications come from Wildlife Insights; acoustic identifications from BirdNET; ' +
     'survey effort from the field deployment log.');
 
+  // Known gaps are published rather than quietly dropped: a plot that
+  // produced data but has no coordinate, a station with no location row, a
+  // taxon with no photograph. All are worth seeing while work is in progress.
+  const gapBox = $('#foot-gaps');
+  const gaps = Array.isArray(manifest.data_gaps) ? manifest.data_gaps : [];
+  if (gapBox) {
+    clear(gapBox);
+    if (!gaps.length) {
+      gapBox.appendChild(el('p', 'foot-text',
+        'No unresolved inconsistencies between the sensor tables, the location ' +
+        'table and the media album.'));
+    } else {
+      const ul = el('ul', 'gap-list');
+      for (const g of gaps) {
+        const li = el('li');
+        li.appendChild(el('span', 'gap-id', g.id || g.kind));
+        li.appendChild(el('span', null, ` ${g.detail || ''}`));
+        ul.appendChild(li);
+      }
+      gapBox.appendChild(ul);
+    }
+  }
+
   setText('#foot-generated',
     `Summaries generated ${manifest.generated_utc || 'unknown'}` +
     (manifest.field_season ? `, field season ${manifest.field_season}.` : '.'));
@@ -340,22 +424,66 @@ async function boot() {
   window.addEventListener('hashchange', () => activate(viewFromHash() || state.views[0].id));
   activate(viewFromHash() || state.views[0].id);
 
-  // species controls
-  const bind = (sel, key) => {
+  /* Control wiring. Each control names the panels it invalidates, so changing
+     the species top-N does not redraw the map, and changing the BirdNET
+     validation group — which changes which detections exist — redraws
+     everything that counts them. */
+  const panelCtx = () => {
+    const view = state.views.find(v => v.id === state.activeId);
+    if (!view || view.status === 'pending') return null;
+    return {
+      view,
+      viewId: view.id,
+      manifest: state.manifest,
+      sources: state.sources,
+      locations: state.sources.locations,
+      birdnet: state.sources.birdnet,
+      effort: state.sources.effort,
+      media: state.media,
+      mediaError: state.mediaError,
+      controls: state.controls
+    };
+  };
+
+  const REDRAW = {
+    species: ctx => renderSpecies(ctx).catch(err => showPanelError('#species-error',
+      'Species chart failed to render.', String(err && err.message || err))),
+    activity: ctx => renderActivity(ctx).catch(err => showPanelError('#activity-error',
+      'Activity curves failed to render.', String(err && err.message || err))),
+    tree: ctx => {
+      const panel = $('#panel-tree');
+      if (panel && panel.hidden) return Promise.resolve();
+      return renderTree(ctx).catch(err => showPanelError('#tree-error',
+        'Detection-rate chart failed to render.', String(err && err.message || err)));
+    },
+    validation: ctx => { renderValidation(ctx); return Promise.resolve(); },
+    stats: ctx => { renderStats(ctx.view); return Promise.resolve(); }
+  };
+
+  const bind = (sel, key, panels, resets) => {
     const node = $(sel);
     if (!node) return;
     node.addEventListener('change', () => {
       state.controls[key] = node.value;
-      const view = state.views.find(v => v.id === state.activeId);
-      if (view && view.status !== 'pending') {
-        renderSpecies({ view, viewId: view.id, sources: state.sources, controls: state.controls });
-      }
+      for (const r of (resets || [])) state.controls[r] = 'all';
+      const ctx = panelCtx();
+      if (!ctx) return;
+      for (const p of panels) REDRAW[p](ctx);
     });
   };
-  bind('#species-topn', 'topN');
-  bind('#species-sort', 'sort');
-  bind('#species-stack', 'stack');
-  bind('#species-threshold', 'threshold');
+
+  bind('#species-topn', 'topN', ['species']);
+  bind('#species-sort', 'sort', ['species']);
+  bind('#species-stack', 'stack', ['species']);
+  bind('#species-class', 'speciesClass', ['species']);
+  // A new validation group is a different set of species, so the activity
+  // species picker must not keep pointing at one that is no longer there.
+  bind('#species-group', 'bnGroup',
+    ['species', 'activity', 'tree', 'stats'], ['activitySpecies']);
+  bind('#activity-class', 'activityClass', ['activity'], ['activitySpecies']);
+  bind('#activity-species', 'activitySpecies', ['activity']);
+  bind('#tree-class', 'treeClass', ['tree']);
+  bind('#tree-topn', 'treeTopN', ['tree']);
 
   let rt;
   window.addEventListener('resize', () => {

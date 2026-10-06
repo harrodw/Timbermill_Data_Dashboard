@@ -8,7 +8,10 @@
    "not yet published" state, never an error.
    ========================================================================== */
 
-import { $, el, clear, fmtInt, fmtNum, plotColor, orderPlotTypes, showPanelError, hidePanelError } from './data.js';
+import {
+  $, el, clear, fmtInt, fmtNum, plotColor, orderPlotTypes, classLabel,
+  classRank, showPanelError, hidePanelError
+} from './data.js';
 
 let lightboxBound = false;
 
@@ -34,39 +37,96 @@ function onImgError(img, label) {
 
 /* ------------------------------------------------------------------ photos */
 
-function renderPhotos(items, body) {
-  const gallery = el('div', 'gallery');
-  let usable = 0;
-  for (const item of items) {
-    const src = item.thumb || item.display;
-    if (!src) continue;
-    usable += 1;
-    const btn = el('button', 'gallery-item');
-    btn.type = 'button';
-    const img = el('img');
-    img.src = src;
-    img.loading = 'lazy';
-    img.alt = item.common_name
-      ? `${item.common_name}${item.sensor_type ? ' recorded by ' + item.sensor_type : ''}`
-      : (item.caption || 'Wildlife photograph');
-    onImgError(img, 'Image file not found');
-    btn.appendChild(img);
+function tile(item) {
+  const src = item.thumb || item.display;
+  if (!src) return null;
+  const name = item.display_name || item.common_name || item.caption || item.id;
+  const btn = el('button', 'gallery-item');
+  btn.type = 'button';
+  const img = el('img');
+  img.src = src;
+  img.loading = 'lazy';
+  img.alt = name
+    ? `${name}${item.sensor_type ? ' recorded by ' + item.sensor_type : ''}`
+    : (item.caption || 'Wildlife photograph');
+  onImgError(img, 'Image file not found');
+  btn.appendChild(img);
 
-    const meta = el('div', 'gallery-meta');
-    meta.appendChild(el('div', 'gallery-common', item.common_name || item.caption || item.id || 'Untitled'));
-    if (item.latin_name) meta.appendChild(el('div', 'gallery-latin', item.latin_name));
-    if (item.sensor_type) meta.appendChild(el('div', 'gallery-sensor', item.sensor_type));
-    btn.appendChild(meta);
-
-    btn.addEventListener('click', () => openLightbox(item));
-    gallery.appendChild(btn);
+  const meta = el('div', 'gallery-meta');
+  meta.appendChild(el('div', 'gallery-common', name || 'Untitled'));
+  if (item.latin_name) meta.appendChild(el('div', 'gallery-latin', item.latin_name));
+  const bits = [];
+  if (item.plot) bits.push(`Plot ${item.plot}`);
+  if (item.schedule) bits.push(item.schedule);
+  meta.appendChild(el('div', 'gallery-sensor',
+    bits.length ? bits.join(' \u00b7 ') : (item.sensor_type || '')));
+  // Number.isFinite on the RAW value, not on Number(...): Number(null) is 0,
+  // which is finite, so coercing first sends a taxon with no detection-table
+  // entry down the "has a count" branch and prints an em dash where the
+  // explanation belongs.
+  if (Number.isFinite(item.n_detections_season)) {
+    meta.appendChild(el('div', 'gallery-count',
+      `${fmtInt(item.n_detections_season)} records`));
+  } else if (item.context) {
+    // Photographed but absent from the detection table -- say so on the tile
+    // rather than letting a missing count read as zero effort.
+    meta.appendChild(el('div', 'gallery-count off', 'not in detection table'));
   }
-  if (!usable) {
+  btn.appendChild(meta);
+
+  btn.addEventListener('click', () => openLightbox(item));
+  return btn;
+}
+
+/**
+ * Photo gallery, grouped by taxonomic class.
+ *
+ * Grouping matters for this album specifically: the bucket-camera set is
+ * twenty-odd reptiles and amphibians with a handful of mammals mixed in, and
+ * ungrouped it reads as an undifferentiated wall of bucket interiors.
+ */
+function renderPhotos(items, body) {
+  const usable = items.filter(i => i.thumb || i.display);
+  if (!usable.length) {
     body.appendChild(emptyState('Media entries have no image paths.',
       'data/media.json listed items for this view but none carried a thumb or display path.'));
     return;
   }
-  body.appendChild(gallery);
+
+  const byClass = new Map();
+  for (const item of usable) {
+    const k = item.taxon_class || null;
+    if (!byClass.has(k)) byClass.set(k, []);
+    byClass.get(k).push(item);
+  }
+  const keys = Array.from(byClass.keys())
+    .sort((a, b) => classRank(a) - classRank(b));
+
+  if (keys.length <= 1) {
+    const gallery = el('div', 'gallery');
+    for (const item of usable) {
+      const t = tile(item);
+      if (t) gallery.appendChild(t);
+    }
+    body.appendChild(gallery);
+    return;
+  }
+
+  for (const k of keys) {
+    const group = byClass.get(k);
+    const wrap = el('div', 'gallery-group');
+    const head = el('h4', 'gallery-group-head');
+    head.appendChild(el('span', null, classLabel(k)));
+    head.appendChild(el('span', 'gallery-group-count', `${group.length}`));
+    wrap.appendChild(head);
+    const gallery = el('div', 'gallery');
+    for (const item of group) {
+      const t = tile(item);
+      if (t) gallery.appendChild(t);
+    }
+    wrap.appendChild(gallery);
+    body.appendChild(wrap);
+  }
 }
 
 function openLightbox(item) {
@@ -74,14 +134,26 @@ function openLightbox(item) {
   const img = $('#lightbox-img');
   if (!box || !img) return;
   img.src = item.display || item.thumb || '';
-  img.alt = item.caption || item.common_name || 'Wildlife photograph';
-  $('#lightbox-common').textContent = item.common_name || '';
+  img.alt = item.caption || item.display_name || item.common_name || 'Wildlife photograph';
+  $('#lightbox-common').textContent = item.display_name || item.common_name || '';
   $('#lightbox-latin').textContent = item.latin_name || '';
-  $('#lightbox-caption').textContent = item.caption || '';
+  $('#lightbox-caption').textContent =
+    [item.caption, item.context].filter(Boolean).join(' ');
   const credit = [];
   if (item.sensor_type) credit.push(item.sensor_type);
+  if (item.plot) credit.push(`plot ${item.plot}`);
+  if (item.schedule) credit.push(`${item.schedule} schedule`);
+  if (item.recorded_local) credit.push(item.recorded_local);
+  // Where the species name came from. A Wildlife Insights identification of
+  // this exact frame and the researcher's own identification of a
+  // hand-exported file are different kinds of claim.
+  if (item.id_source === 'wildlife_insights') {
+    credit.push('identified in Wildlife Insights');
+  } else if (item.id_source === 'researcher') {
+    credit.push('identified by the researcher');
+  }
   if (item.credit) credit.push(item.credit);
-  $('#lightbox-credit').textContent = credit.join(' \u2014 ');
+  $('#lightbox-credit').textContent = credit.join(' \u00b7 ');
   box.hidden = false;
   const close = $('#lightbox-close');
   if (close) close.focus();
@@ -197,12 +269,24 @@ function renderAudio(items, body) {
       meta.appendChild(el('p', 'det-title', 'This species across the 2026 season'));
       const bits = [];
       if (Number.isFinite(Number(sctx.n_detections))) {
-        bits.push(`${fmtInt(sctx.n_detections)} unvalidated BirdNET detections`);
+        // A cutoff-filtered count and a raw one are different quantities and
+        // must not share a label.
+        bits.push(sctx.filtered
+          ? `${fmtInt(sctx.n_detections)} BirdNET detections at or above the ` +
+            `validated cutoff of ${fmtNum(Number(sctx.threshold), 2)}` +
+            (Number.isFinite(Number(sctx.n_detections_raw))
+              ? ` (of ${fmtInt(sctx.n_detections_raw)} raw)` : '')
+          : `${fmtInt(sctx.n_detections)} unvalidated BirdNET detections`);
       }
       if (Number.isFinite(Number(sctx.n_plots))) {
-        bits.push(`at ${fmtInt(sctx.n_plots)} of 35 ARU plots`);
+        bits.push(`at ${fmtInt(sctx.n_plots)} ARU plots`);
       }
       if (bits.length) meta.appendChild(el('p', 'audio-caption', bits.join(' ') + '.'));
+      if (Number.isFinite(Number(sctx.n_clips_listened)) && sctx.n_clips_listened) {
+        meta.appendChild(el('p', 'audio-caption',
+          `${fmtInt(sctx.n_clips_listened)} clips of this species were reviewed by ear ` +
+          `to establish that cutoff.`));
+      }
 
       const byPt = sctx.by_plot_type && typeof sctx.by_plot_type === 'object'
         ? sctx.by_plot_type : null;
@@ -227,9 +311,9 @@ function renderAudio(items, body) {
         }
         meta.appendChild(bars);
         meta.appendChild(el('p', 'panel-note',
-          'Detections by plot type for this species over the whole season, ' +
-          'not for this clip. Uncorrected for differences in recording effort ' +
-          'among plots.'));
+          (sctx.note ? sctx.note + ' ' : '') +
+          'Split by plot type and uncorrected for differences in recording ' +
+          'effort among plots.'));
       }
     } else if (dets.length) {
       meta.appendChild(el('p', 'det-title', 'BirdNET detections in this clip'));
