@@ -241,32 +241,78 @@ export function fillClassControl(sel, list, current) {
    separate from a dusk one. */
 export const ACT_SD_BINS = 1.4;
 
-function wrappedKernel(nBins, sdBins) {
-  /* Row i holds the weights that bin i's smoothed value draws from every
-     other bin. Precomputed once per bin count: it is the same matrix for
-     every species and every curve on the page. */
+function smoothKernel(m, sdBins, circular) {
+  /* Row i holds the weights that position i's smoothed value draws from every
+     other position. Precomputed once per (length, circular) pair: it is the
+     same matrix for every species and every curve on the page.
+
+     `circular` wraps the distance at the halfway point, which is right when
+     the series covers the whole 24 hours. It is WRONG when the series covers
+     only the sampled window: there, the first and last positions are dusk and
+     morning, which are fourteen hours apart, not adjacent. Each row is
+     normalised to sum to 1, so a non-circular kernel simply uses the
+     neighbours it has at the ends rather than inventing a decay toward
+     zero. */
   const rows = [];
-  for (let i = 0; i < nBins; i += 1) {
-    const w = new Array(nBins).fill(0);
+  for (let i = 0; i < m; i += 1) {
+    const w = new Array(m).fill(0);
     let sum = 0;
-    for (let j = 0; j < nBins; j += 1) {
+    for (let j = 0; j < m; j += 1) {
       let d = Math.abs(i - j);
-      if (d > nBins / 2) d = nBins - d;          // wrap at midnight
+      if (circular && d > m / 2) d = m - d;
       const v = Math.exp(-0.5 * (d / sdBins) ** 2);
       w[j] = v;
       sum += v;
     }
-    for (let j = 0; j < nBins; j += 1) w[j] /= sum;
+    for (let j = 0; j < m; j += 1) w[j] /= sum;
     rows.push(w);
   }
   return rows;
 }
 
 const KERNEL_CACHE = new Map();
-function kernelFor(nBins) {
-  const key = `${nBins}:${ACT_SD_BINS}`;
-  if (!KERNEL_CACHE.has(key)) KERNEL_CACHE.set(key, wrappedKernel(nBins, ACT_SD_BINS));
+function kernelFor(m, circular) {
+  const key = `${m}:${ACT_SD_BINS}:${circular ? 1 : 0}`;
+  if (!KERNEL_CACHE.has(key)) {
+    KERNEL_CACHE.set(key, smoothKernel(m, ACT_SD_BINS, circular));
+  }
   return KERNEL_CACHE.get(key);
+}
+
+/**
+ * The run of bins a schedule actually sampled, in time order.
+ *
+ * Returns `{start, order, circular}`. With every bin sampled the series is the
+ * whole day and wraps. With a gap — the ARUs record a night schedule, not a
+ * 24-hour one — the series starts just after the LONGEST unsampled run, so a
+ * window that straddles midnight comes back as one contiguous dusk-to-morning
+ * sequence instead of two fragments at opposite ends of the axis.
+ */
+export function sampledRun(sampled, nBins) {
+  const mask = (Array.isArray(sampled) && sampled.length === nBins)
+    ? sampled.map(Number) : new Array(nBins).fill(1);
+  if (mask.every(v => v)) {
+    return { start: 0, order: mask.map((_, i) => i), circular: true };
+  }
+  if (!mask.some(v => v)) return { start: 0, order: [], circular: false };
+
+  let best = { len: 0, end: 0 };
+  let run = 0;
+  for (let b = 0; b < nBins * 2; b += 1) {
+    if (!mask[b % nBins]) {
+      run += 1;
+      if (run > best.len) best = { len: run, end: b % nBins };
+    } else {
+      run = 0;
+    }
+  }
+  const start = (best.end + 1) % nBins;
+  const order = [];
+  for (let k = 0; k < nBins; k += 1) {
+    const i = (start + k) % nBins;
+    if (mask[i]) order.push(i);
+  }
+  return { start, order, circular: false };
 }
 
 /**
@@ -294,35 +340,43 @@ function kernelFor(nBins) {
  * on few detections, which is exactly where a single-species curve should not
  * be over-read.
  */
-export function activityCurve(counts, effort) {
+export function activityCurve(counts, effort, sampled) {
   const n = (counts || []).length;
-  const total = (counts || []).reduce((a, b) => a + (Number(b) || 0), 0);
-  if (!n || !total) return { x: [], y: [], lo: [], hi: [], n: 0, ok: false };
-  const K = kernelFor(n);
+  if (!n) return { x: [], y: [], lo: [], hi: [], n: 0, ok: false };
 
-  const num = new Array(n).fill(0);
-  const varNum = new Array(n).fill(0);
-  const den = new Array(n).fill(0);
-  for (let i = 0; i < n; i += 1) {
+  const { start, order, circular } = sampledRun(sampled, n);
+  const m = order.length;
+  const total = order.reduce((a, i) => a + (Number(counts[i]) || 0), 0);
+  if (!m || !total) {
+    return { x: [], y: [], lo: [], hi: [], n: total, ok: false };
+  }
+  const K = kernelFor(m, circular);
+
+  const num = new Array(m).fill(0);
+  const varNum = new Array(m).fill(0);
+  const den = new Array(m).fill(0);
+  for (let i = 0; i < m; i += 1) {
     const w = K[i];
-    for (let j = 0; j < n; j += 1) {
-      const c = Number(counts[j]) || 0;
+    for (let j = 0; j < m; j += 1) {
+      const c = Number(counts[order[j]]) || 0;
       num[i] += w[j] * c;
       varNum[i] += w[j] * w[j] * c;
-      den[i] += w[j] * (effort ? (Number(effort[j]) || 0) : 1);
+      den[i] += w[j] * (effort ? (Number(effort[order[j]]) || 0) : 1);
     }
   }
 
-  const rate = new Array(n).fill(0);
-  const se = new Array(n).fill(0);
-  for (let i = 0; i < n; i += 1) {
+  const rate = new Array(m).fill(0);
+  const se = new Array(m).fill(0);
+  for (let i = 0; i < m; i += 1) {
     if (den[i] > 0) {
       rate[i] = num[i] / den[i];
       se[i] = Math.sqrt(varNum[i]) / den[i];
     }
   }
 
-  // Normalize to unit area over 24 h. Bin width in hours = 24 / n.
+  // Unit area over the SAMPLED window, not over 24 h. Scaling over a window
+  // the schedule never covered would make the height of every curve depend on
+  // how much unrecorded day it was divided by.
   const dx = 24 / n;
   const area = rate.reduce((a, b) => a + b, 0) * dx;
   const k = area > 0 ? 1 / area : 0;
@@ -331,17 +385,28 @@ export function activityCurve(counts, effort) {
   const y = [];
   const lo = [];
   const hi = [];
-  for (let i = 0; i < n; i += 1) {
-    x.push((i + 0.5) * dx);
+  for (let i = 0; i < m; i += 1) {
+    // Anchored hours: the window may straddle midnight, so x can exceed 24
+    // and the axis relabels it. Keeping it monotonic is what lets the line be
+    // drawn in one piece.
+    x.push((start + i + 0.5) * dx);
     y.push(rate[i] * k);
     lo.push(Math.max(0, (rate[i] - 1.96 * se[i]) * k));
     hi.push((rate[i] + 1.96 * se[i]) * k);
   }
-  // Close the circle so the drawn line meets itself at midnight instead of
-  // stopping short of both axis ends.
-  x.unshift(0); y.unshift(y[n - 1]); lo.unshift(lo[n - 1]); hi.unshift(hi[n - 1]);
-  x.push(24); y.push(y[1]); lo.push(lo[1]); hi.push(hi[1]);
-  return { x, y, lo, hi, n: total, ok: true };
+  if (circular) {
+    // Close the circle so the drawn line meets itself at midnight instead of
+    // stopping short of both axis ends.
+    x.unshift(start * dx); y.unshift(y[m - 1]);
+    lo.unshift(lo[m - 1]); hi.unshift(hi[m - 1]);
+    x.push((start + m) * dx); y.push(y[1]); lo.push(lo[1]); hi.push(hi[1]);
+  }
+  return {
+    x, y, lo, hi, n: total, ok: true,
+    startHour: start * dx,
+    endHour: (start + m) * dx,
+    circular
+  };
 }
 
 /** Element-wise sum of several equal-length bin arrays. */

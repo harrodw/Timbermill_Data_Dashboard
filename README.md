@@ -157,13 +157,22 @@ is published anywhere on the site.
 
 ## Activity curves
 
-Half-hour histograms of detection time are smoothed with a **wrapped** Gaussian
-kernel (σ = 1.4 bins ≈ 42 min) and scaled so each curve integrates to 1 over
-the 24-hour cycle. Wrapping matters: a detection at 23:50 is twenty minutes
-from one at 00:10, and a non-circular smoother would invent a trough at
-midnight. Scaling to unit area makes curve **shapes** comparable between plot
-types with very different totals; the totals themselves are printed beside the
-chart and in every hover.
+Half-hour histograms of detection time are smoothed with a Gaussian kernel
+(σ = 1.4 bins ≈ 42 min) and scaled to unit area, which makes curve **shapes**
+comparable between plot types with very different totals; the totals themselves
+are printed beside the chart and in every hover.
+
+The kernel wraps around midnight **only when the sensor sampled the whole
+clock**. For the cameras it does: a detection at 23:50 is twenty minutes from
+one at 00:10, and a non-circular smoother would invent a trough at midnight.
+For the ARUs it must not — see the next section.
+
+Each panel has a **plot-type toggle**. "Separate" draws one curve per plot type;
+"Combined" pools them into a single curve by summing counts *and* effort before
+dividing. Pooling the two separately is deliberate: averaging four per-plot-type
+densities would give Interior Forest, with the least effort behind it, the same
+weight as Turbine Opening. Summing first weights each plot type by the survey
+effort actually behind it.
 
 Shaded bands are 95% intervals from propagating Poisson counts through the same
 kernel. They are the honest brake on over-reading a single-species curve: pick
@@ -178,6 +187,45 @@ each midday hour. A raw histogram of BirdNET detection times would therefore
 show a dawn spike and an empty afternoon that are mostly an artefact of when
 the recorders were on. The acoustic panel plots detections per recording-hour,
 reconstructed from all 29,096 recording files.
+
+### The acoustic curves are clipped to the recorded window
+
+Effort correction fixes the *shape* of the curve but not its *extent*: dividing
+a handful of midday detections by a handful of midday recording-hours produces
+a noisy, wildly uncertain density across two-thirds of the x-axis that the
+schedule never meant to sample. So the acoustic panel draws only the half-hours
+the recorders actually covered, **17:30 → 08:30** (30 of 48 bins, 15 hours),
+and the x-axis is labelled with that window.
+
+The window is derived, not typed in. A bin counts as sampled when it carries at
+least 3% of the peak bin's recording effort. That threshold sits inside a wide
+empirical gap rather than being a round number: the daytime plateau never
+exceeds ~2.1% of peak, and no scheduled bin falls below ~3.6%. The resulting
+window holds **93.9% of all recording effort** and 95.8% of detections above
+cutoff.
+
+Two things follow, and both are published in `birdnet.json` so the panel can
+state them rather than hide them:
+
+- **The schedule is solar-anchored, not fixed-clock.** The median first file of
+  the night moves from 17.9 h in March to 19.6 h in August, tracking sunset.
+  Measured against computed sunset for the study site, recording starts a median
+  of **1.4 hours *before* sunset** — not at sunset — and ends a median of 0.5
+  hours after sunrise. The published window is the envelope across the whole
+  season, so on any individual night the recorder started somewhat inside it.
+- **4.3% of detections fall outside the window and are not drawn.** Every one
+  of them comes from 590 off-schedule daytime recordings at just four plots —
+  IF07, TO04, RE05 and TO15. That was checked at record level, not assumed: of
+  the 73,068 excluded detections in the validated group, 100% trace to those
+  four plots and none to any other. The counts are published as
+  `activity.off_schedule.n_detections_excluded` so the activity panel and the
+  species chart can be reconciled.
+
+Because dusk and morning are 14 hours apart rather than adjacent, the smoother
+is **not** wrapped for the acoustic curves; wrapping would smear the dawn
+chorus backwards into the previous evening. The x-axis runs past 24 (17:30 is
+17.5, 08:30 is 32.5) so the night reads left to right as one continuous series,
+and tick labels are rewritten back to clock time.
 
 Recording length is inferred per file from the largest detection offset it
 contains. The two scheduled lengths separate cleanly — no file in the dataset
@@ -323,9 +371,28 @@ Three counting units appear and none are interchangeable:
   species are filtered to their own cutoff; every other group is raw, and the
   group selector says which.
 
-Raw counts are not corrected for survey effort, which differs substantially
-among sensors — the effort chart shows how much. The rate chart is corrected;
-the activity panel is corrected for the ARUs.
+### Scaling the species chart by effort
+
+The species chart has a **Scale** control: raw counts, or detections per 100
+units of survey effort. The denominator is per plot type, not one figure for
+the whole view, because effort is badly unbalanced:
+
+| View | Unit | TO | TE | IF | RE |
+|---|---|---|---|---|---|
+| Bucket cameras | hut-days | 2,864 | 2,716 | 1,773 | 1,626 |
+| Parallel cameras | camera-days | 1,581 | 1,753 | 941 | 1,692 |
+| Bird & frog audio | recording-hours | 4,862 | — | 2,501 | 2,247 |
+
+Interior Forest ran roughly 60% of Turbine Opening's camera effort, so a raw
+stacked bar makes Interior Forest look quieter than it is. Scaling divides each
+*segment* of the bar by its own plot type's effort, so the segments stay
+comparable to each other and the total becomes a pooled rate. Hovers keep the
+unscaled count visible ("N records before scaling") so nothing is lost.
+
+This is a different question from the rate-vs-occupancy chart. Scaling here
+reweights the composition of a stacked bar across plot types; the christmas
+tree asks how often versus how widely a single taxon was recorded. The
+activity panel is corrected for the ARUs only, for the reason given above.
 
 ## Map coordinates are deliberately wrong
 
@@ -376,11 +443,15 @@ python3 private/shots.py http://localhost:8000/ private/shots_new
 
 `frontend_check.mjs` runs the dashboard's own selector functions against the
 published summaries and checks the things a glance at the page cannot: that
-every activity curve integrates to 1, that per-plot-type counts sum to each
-taxon's total, that occupancy equals sites-detected over sites, that rate equals
-count over effort, that map popup tallies reconcile with the species files, that
-filtering never increases a count, and that every herp taxon is either in the
-album or declared a gap. It stages the ES modules into `private/.jscheck/` so
+every activity curve integrates to 1 over the window it was drawn on, that the
+sampled window is contiguous in clock time, that a windowed curve does *not*
+close at midnight while a fully sampled one does, that the combined curve's
+counts and effort equal the sum of the separate ones, that every plot type
+carrying detections also carries an effort denominator, that per-plot-type
+counts sum to each taxon's total, that occupancy equals sites-detected over
+sites, that rate equals count over effort, that map popup tallies reconcile
+with the species files, that filtering never increases a count, and that every
+herp taxon is either in the album or declared a gap. It stages the ES modules into `private/.jscheck/` so
 Node reads them as modules without a `package.json` being published in `docs/`.
 
 `shots.py` renders all three views in headless Firefox, forces lazy images to

@@ -19,7 +19,7 @@ import {
   plotTypeRank, classLabel, classRank, fillClassControl, activityCurve,
   sumBins, fmtClock, showPanelError, hidePanelError, showChartMessage,
   waitForGlobal
-} from './data.js?v=a5de6b6827';
+} from './data.js?v=5344add485';
 
 const PLOTLY_CONFIG = {
   displayModeBar: true,
@@ -135,6 +135,40 @@ export function speciesSource(view, sources) {
   if (view.speciesKind === 'birdnet') return sources.birdnet;
   if (view.speciesKind === 'ahdrift') return sources.species_ahdrift;
   return sources.species_parallel;
+}
+
+/**
+ * Per-plot-type survey effort for a view, plus the total.
+ *
+ * Returns `{byType, total, unit, per}` or null when the file publishes no
+ * denominator. `per` is the multiplier the chart reports in (per 100 units),
+ * which keeps small rates off the axis as leading zeros.
+ *
+ * The denominator is per PLOT TYPE, not one figure for the view, because
+ * effort is not balanced across plot types -- interior forest ran 941
+ * camera-days against turbine edge's 1,753. Scaling a stacked bar by a single
+ * view-wide total would leave each segment still proportional to how long that
+ * plot type was surveyed, which is the confound the scaling exists to remove.
+ */
+export function effortDenominators(view, sources) {
+  const src = speciesSource(view, sources);
+  if (!src || !Array.isArray(src.by_plot_type) || !src.effort_unit) return null;
+  const byType = {};
+  let total = 0;
+  for (const row of src.by_plot_type) {
+    const e = Number(row.effort);
+    if (!Number.isFinite(e) || e <= 0) continue;
+    byType[row.plot_type] = e;
+    total += e;
+  }
+  if (!total) return null;
+  return { byType, total, unit: src.effort_unit, per: 100 };
+}
+
+/** Scale a count by the effort for its plot type. */
+function scaleCount(count, effort, per) {
+  if (!Number.isFinite(effort) || effort <= 0) return null;
+  return (count * per) / effort;
 }
 
 export function filterByClass(list, klass) {
@@ -398,12 +432,31 @@ export async function renderSpecies(ctx) {
   const group = isBirdnet
     ? (src.groups || []).find(g => g.id === (controls.bnGroup || 'validated'))
     : null;
-  const unitLabel = isBirdnet
+
+  // Hoisted above the sub-heading: the heading text has to know whether the
+  // bars it is describing are raw or effort-scaled.
+  const den = effortDenominators(view, sources);
+  const scaled = !!den && controls.speciesScale === 'effort';
+  let unitLabel = isBirdnet
     ? (group && group.filtered ? 'Detections above cutoff' : 'Detections (unfiltered)')
     : (view.speciesKind === 'ahdrift' ? 'Detection events' : 'Sequences');
 
   const sub = $('#species-sub');
-  if (sub) sub.textContent = (src && src.note) || '';
+  if (sub) {
+    // The effort claim has to follow the Scale control rather than sit in the
+    // published note, or the panel contradicts the axis it is drawing.
+    let tail = '';
+    if (scaled && den) {
+      tail = ` Bars are divided by each plot type's own survey effort ` +
+        `(${fmtInt(den.total)} ${den.unit} in total), so plot types that ran ` +
+        `longer are not credited with more detections for it.`;
+    } else if (den) {
+      tail = ' Raw counts, not corrected for the uneven survey effort among ' +
+        'plot types \u2014 switch Scale to see them per unit effort, or use ' +
+        'the detection-rate panel.';
+    }
+    sub.textContent = ((src && src.note) || '') + tail;
+  }
 
   const note = $('#species-note');
   if (note) {
@@ -438,6 +491,30 @@ export async function renderSpecies(ctx) {
     return;
   }
 
+  // Effort scaling. When on, every plotted value is divided by the survey
+  // effort of its own plot type, and the ranking is recomputed on the scaled
+  // totals -- ranking by raw count while drawing rates would put the bars in
+  // an order the chart does not show.
+  const scaleWrap = $('#species-scale-wrap');
+  if (scaleWrap) scaleWrap.hidden = !den;
+  if (scaled) {
+    for (const sp of list) {
+      sp.raw_count = sp.count;
+      const by = {};
+      let tot = 0;
+      for (const [pt, n] of Object.entries(sp.by_plot_type || {})) {
+        const v = scaleCount(Number(n) || 0, den.byType[pt], den.per);
+        if (v === null) continue;
+        by[pt] = v;
+        tot += v;
+      }
+      sp.by_plot_type = by;
+      sp.count = tot;
+    }
+  }
+  if (scaled) unitLabel = `${unitLabel} per ${den.per} ${den.unit}`;
+  const fmtVal = scaled ? (v => fmtNum(v, v >= 10 ? 1 : 2)) : (v => fmtInt(v));
+
   const shown = selectSpecies(list, controls.topN, controls.sort);
 
   let Plotly;
@@ -465,10 +542,14 @@ export async function renderSpecies(ctx) {
       x: rows.map(s => Number(s.by_plot_type && s.by_plot_type[pt]) || 0),
       marker: { color: plotColor(pt), line: { width: 0 } },
       customdata: rows.map(s => [s.latin || 'no Latin name recorded', classLabel(s.klass),
-        s.n_plots ?? '\u2014', s.count]),
+        s.n_plots ?? '\u2014', fmtVal(s.count),
+        scaled ? fmtInt(s.raw_count) : null]),
       hovertemplate:
-        `<b>%{y}</b><br><i>%{customdata[0]}</i> \u00b7 %{customdata[1]}<br>${pt}: %{x:,}<br>` +
-        `Total %{customdata[3]:,} across %{customdata[2]} plots<extra></extra>`
+        `<b>%{y}</b><br><i>%{customdata[0]}</i> \u00b7 %{customdata[1]}<br>` +
+        `${pt}: %{x:` + (scaled ? '.3g' : ',') + `}<br>` +
+        `Total %{customdata[3]} across %{customdata[2]} plots` +
+        (scaled ? `<br>%{customdata[4]} records before scaling` : '') +
+        `<extra></extra>`
     }));
   } else {
     traces = [{
@@ -479,10 +560,12 @@ export async function renderSpecies(ctx) {
       x: rows.map(s => s.count),
       marker: { color: '#2f4a58', line: { width: 0 } },
       customdata: rows.map(s => [s.latin || 'no Latin name recorded', classLabel(s.klass),
-        s.n_plots ?? '\u2014']),
+        s.n_plots ?? '\u2014', scaled ? fmtInt(s.raw_count) : null]),
       hovertemplate:
         `<b>%{y}</b><br><i>%{customdata[0]}</i> \u00b7 %{customdata[1]}<br>` +
-        `%{x:,} across %{customdata[2]} plots<extra></extra>`
+        `%{x:` + (scaled ? '.3g' : ',') + `} across %{customdata[2]} plots` +
+        (scaled ? `<br>%{customdata[3]} records before scaling` : '') +
+        `<extra></extra>`
     }];
   }
 
@@ -524,7 +607,20 @@ export function activityMeta(view, sources) {
  * @param {object} meta   the file's .activity block
  * @param {string} speciesName  one species name, or 'all'
  */
-export function activityTraces(list, meta, speciesName) {
+/**
+ * Build activity curves for a selection of species.
+ *
+ * @param {Array}  list    normalized species rows (already class/group filtered)
+ * @param {object} meta    the file's .activity block
+ * @param {string} speciesName  one species name, or 'all'
+ * @param {boolean} combined    pool every plot type into one curve
+ *
+ * In combined mode the counts AND the effort are summed before the division,
+ * which is the pooled rate. Averaging the four per-plot-type densities instead
+ * would weight a plot type with 900 recording-hours the same as one with
+ * 4,900 and is not a rate of anything.
+ */
+export function activityTraces(list, meta, speciesName, combined) {
   if (!meta || !Number.isFinite(Number(meta.bins))) return [];
   const nBins = Number(meta.bins);
   const chosen = (speciesName && speciesName !== 'all')
@@ -534,15 +630,38 @@ export function activityTraces(list, meta, speciesName) {
 
   const effortHours = (meta.effort_mode === 'per_bin_hours' && meta.effort_hours)
     ? meta.effort_hours : null;
-
+  const sampled = Array.isArray(meta.sampled) ? meta.sampled : null;
   const types = orderPlotTypes(chosen.flatMap(s => Object.keys(s.activity || {})));
+
+  if (combined) {
+    const counts = sumBins(
+      types.flatMap(pt => chosen.map(s => (s.activity || {})[pt])), nBins);
+    const effort = effortHours
+      ? sumBins(types.map(pt => effortHours[pt]), nBins) : null;
+    const curve = activityCurve(counts, effort, sampled);
+    if (!curve.ok) return [];
+    return [{
+      plot_type: 'All plot types',
+      combined: true,
+      curve,
+      counts,
+      effort,
+      n: curve.n,
+      n_species: chosen.filter(
+        s => Object.keys(s.activity || {}).length).length,
+      n_plot_types: types.length
+    }];
+  }
+
   const out = [];
   for (const pt of types) {
     const counts = sumBins(chosen.map(s => (s.activity || {})[pt]), nBins);
-    const curve = activityCurve(counts, effortHours ? effortHours[pt] : null);
+    const curve = activityCurve(counts, effortHours ? effortHours[pt] : null,
+                                sampled);
     if (!curve.ok) continue;
     out.push({
       plot_type: pt,
+      combined: false,
       curve,
       counts,
       effort: effortHours ? effortHours[pt] : null,
@@ -606,30 +725,63 @@ export async function renderActivity(ctx) {
   controls.activitySpecies =
     fillActivitySpeciesControl($('#activity-species'), options, controls.activitySpecies);
 
-  const traces = activityTraces(list, meta, controls.activitySpecies);
+  const combined = controls.activityCombined === 'combined';
+  const combinedSel = $('#activity-combined');
+  if (combinedSel && !combinedSel.options.length) {
+    for (const [v, label] of [['separate', 'Separate curves'],
+                              ['combined', 'All plot types combined']]) {
+      const o = el('option', null, label);
+      o.value = v;
+      combinedSel.appendChild(o);
+    }
+    combinedSel.value = controls.activityCombined || 'separate';
+  }
+  const traces = activityTraces(list, meta, controls.activitySpecies, combined);
 
   const sub = $('#activity-sub');
   if (sub) {
     const what = view.speciesKind === 'birdnet' ? 'vocalizations' : 'detections';
+    const win = meta.window || null;
     sub.textContent =
-      `Time of day of ${what}, one curve per plot type. ` +
+      `Time of day of ${what}, ` +
+      (combined ? 'pooled across all plot types. ' : 'one curve per plot type. ') +
       (meta.effort_mode === 'per_bin_hours'
-        ? 'Plotted as detections per recording-hour, because recording effort is far from even across the day.'
+        ? 'Plotted as detections per recording-hour, because recording effort is far from even across the night.'
         : 'Cameras ran continuously, so no effort correction is needed.') +
-      ' Each curve integrates to 1 over the 24-hour cycle, so the curves are comparable in shape, not in height.';
+      (win && win.start_clock
+        ? ` Drawn only over the ${win.hours} h the schedule actually sampled ` +
+          `(${win.start_clock}\u2013${win.end_clock}), which carries ` +
+          `${win.pct_effort_covered}% of all recording effort; each curve ` +
+          `integrates to 1 over that window.`
+        : ' Each curve integrates to 1 over the 24-hour cycle.') +
+      ' Curves are comparable in shape, not in height.';
   }
 
   const noteEl = $('#activity-note');
   if (noteEl) {
     clear(noteEl);
     if (meta.note) noteEl.appendChild(el('span', null, meta.note));
+    if (meta.window && meta.window.note) {
+      noteEl.appendChild(el('p', 'panel-note', meta.window.note));
+    }
+    if (meta.off_schedule && meta.off_schedule.note) {
+      noteEl.appendChild(el('p', 'panel-note', meta.off_schedule.note));
+    }
     if (meta.duration_note) noteEl.appendChild(el('p', 'panel-note', meta.duration_note));
     if (meta.timestamp_note) noteEl.appendChild(el('p', 'panel-note', meta.timestamp_note));
+    // Whether the smoother wrapped depends on whether the whole clock was
+    // sampled, so this sentence has to follow the curves that were drawn.
+    const wrapped = traces.length > 0 && traces[0].curve.circular;
     noteEl.appendChild(el('p', 'panel-note',
       'Shaded bands are 95% intervals from propagating Poisson counts through the ' +
       'same kernel; a band wider than the curve means the shape is carried by too ' +
-      'few detections to read. Curves are wrapped at midnight, so a peak either ' +
-      'side of 00:00 is one peak, not two.'));
+      'few detections to read. ' +
+      (wrapped
+        ? 'Curves are wrapped at midnight, so a peak either side of 00:00 is ' +
+          'one peak, not two.'
+        : 'Because the recorders sampled a night rather than the whole clock, ' +
+          'the curves are not wrapped at midnight: the left and right ends are ' +
+          'dusk and the following morning, roughly 15 hours apart.')));
   }
 
   if (!traces.length) {
@@ -649,9 +801,10 @@ export async function renderActivity(ctx) {
     return;
   }
 
+  const COMBINED_COLOR = '#2f4a58';
   const data = [];
   for (const t of traces) {
-    const color = plotColor(t.plot_type);
+    const color = t.combined ? COMBINED_COLOR : plotColor(t.plot_type);
     // Band first so the line draws over it.
     data.push({
       type: 'scatter', mode: 'lines', showlegend: false, hoverinfo: 'skip',
@@ -672,16 +825,31 @@ export async function renderActivity(ctx) {
     });
   }
 
+  // The axis follows the window the schedule sampled. For continuously
+  // running cameras that is the whole day; for the ARUs it is dusk to morning,
+  // which straddles midnight, so the hours run past 24 and the tick labels are
+  // relabelled modulo 24 rather than the series being cut in two.
+  const ref = traces[0].curve;
+  const x0 = Number.isFinite(ref.startHour) ? ref.startHour : 0;
+  const x1 = Number.isFinite(ref.endHour) ? ref.endHour : 24;
+  const step = (x1 - x0) > 18 ? 4 : 2;
+  const ticks = [];
+  for (let h = Math.ceil(x0 / step) * step; h <= x1 + 1e-9; h += step) ticks.push(h);
+  const windowed = !ref.circular;
+  const axisTitle = windowed
+    ? `Time of day (recorded window ${fmtClock(x0)}\u2013${fmtClock(x1)})`
+    : 'Time of day (h)';
+
   const layout = baseLayout({
     height: 430,
     margin: { l: 72, r: 24, t: 14, b: 58 },
     hovermode: 'x unified',
     xaxis: Object.assign({}, AXIS, {
-      title: { text: 'Time of day (h)' },
-      range: [0, 24],
+      title: { text: axisTitle },
+      range: [x0, x1],
       tickmode: 'array',
-      tickvals: [0, 4, 8, 12, 16, 20, 24],
-      ticktext: ['0', '4', '8', '12', '16', '20', '24'],
+      tickvals: ticks,
+      ticktext: ticks.map(h => fmtClock(h)),
       showgrid: true, gridcolor: '#f1f3f5'
     }),
     yaxis: Object.assign({}, AXIS, {
@@ -692,7 +860,7 @@ export async function renderActivity(ctx) {
       },
       rangemode: 'tozero'
     }),
-    shapes: [4, 8, 12, 16, 20].map(h => ({
+    shapes: ticks.filter(h => h > x0 && h < x1).map(h => ({
       type: 'line', x0: h, x1: h, y0: 0, y1: 1, yref: 'paper',
       line: { color: '#e4e7ea', width: 1, dash: 'dash' }, layer: 'below'
     }))
@@ -714,7 +882,8 @@ export async function renderActivity(ctx) {
     for (const t of traces) {
       const peak = t.curve.y.indexOf(Math.max(...t.curve.y));
       const s = el('span');
-      s.appendChild(el('span', 'k', `${t.plot_type}: `));
+      s.appendChild(el('span', 'k',
+        `${t.plot_type}${t.combined ? ` (${t.n_plot_types})` : ''}: `));
       s.appendChild(el('span', null,
         `${fmtInt(t.n)} detections, peak ${fmtClock(t.curve.x[peak])}`));
       stats.appendChild(s);

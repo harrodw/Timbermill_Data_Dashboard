@@ -9,15 +9,15 @@
 
 import {
   $, el, clear, setText, fmtInt, fmtDays, tryLoadJSON, showPanelError
-} from './data.js?v=a5de6b6827';
-import { renderMap, invalidateMap } from './map.js?v=a5de6b6827';
+} from './data.js?v=5344add485';
+import { renderMap, invalidateMap } from './map.js?v=5344add485';
 import {
   renderEffort, renderSpecies, renderActivity, renderTree, fillGroupControl,
   resizeCharts, effortRowsForView, aruRowsForView, effortStatsFromRows,
   normalizeSpecies, speciesSource
-} from './charts.js?v=a5de6b6827';
-import { renderMedia, mediaCount } from './media.js?v=a5de6b6827';
-import { renderValidation, renderIdentification } from './validation.js?v=a5de6b6827';
+} from './charts.js?v=5344add485';
+import { renderMedia, mediaCount } from './media.js?v=5344add485';
+import { renderValidation, renderIdentification } from './validation.js?v=5344add485';
 
 window.__dashboardBooted = true;
 
@@ -46,8 +46,9 @@ const state = {
   controls: {
     topN: '25', sort: 'count_desc', stack: 'stacked',
     bnGroup: 'validated',
-    speciesClass: 'all',
+    speciesClass: 'all', speciesScale: 'raw',
     activityClass: 'all', activitySpecies: 'all',
+    activityCombined: 'separate',
     treeClass: 'all', treeTopN: '25'
   }
 };
@@ -476,12 +477,14 @@ async function boot() {
   bind('#species-sort', 'sort', ['species']);
   bind('#species-stack', 'stack', ['species']);
   bind('#species-class', 'speciesClass', ['species']);
+  bind('#species-scale', 'speciesScale', ['species']);
   // A new validation group is a different set of species, so the activity
   // species picker must not keep pointing at one that is no longer there.
   bind('#species-group', 'bnGroup',
     ['species', 'activity', 'tree', 'stats'], ['activitySpecies']);
   bind('#activity-class', 'activityClass', ['activity'], ['activitySpecies']);
   bind('#activity-species', 'activitySpecies', ['activity']);
+  bind('#activity-combined', 'activityCombined', ['activity']);
   bind('#tree-class', 'treeClass', ['tree']);
   bind('#tree-topn', 'treeTopN', ['tree']);
 

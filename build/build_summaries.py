@@ -85,6 +85,12 @@ JITTER_MAX_M = 110.0
 ACT_BINS = 48
 ACT_BIN_SECONDS = 86400 // ACT_BINS
 
+# A half-hour counts as sampled when its recording effort reaches this
+# fraction of the busiest half-hour. Placed in the empirical gap between the
+# scheduled night bins and the off-schedule daytime plateau: see the comment
+# in build_birdnet() where the mask is computed.
+ACT_MIN_EFFORT_FRACTION = 0.03
+
 # ARU recordings come in two lengths; the schedule runs 5-minute files through
 # most of the night and a 60-minute file over the dawn chorus. Detections are
 # timestamped within their file, so a file's length is inferred from the
@@ -465,9 +471,7 @@ def build_ahdrift() -> dict:
             "motion-capture image in the 2026 season has been reviewed, and "
             "plot-days that produced no detection are recorded explicitly, "
             "so these counts are complete for the species on the cleaned "
-            "list rather than a work-in-progress tally. Counts are not "
-            "corrected for differences in survey effort among plots; the "
-            "detection-rate panel is."
+            "list rather than a work-in-progress tally."
         ),
         "counting_note": (
             "Events are counted as rows. The cleaned export carries 0 in "
@@ -498,6 +502,7 @@ def build_ahdrift() -> dict:
         "date_range": {"first": str(df["Date"].min()),
                        "last": str(df["Date"].max())},
         "by_class": by_class,
+        "effort_unit": "hut-days",
         "by_plot_type": [
             {"plot_type": pt,
              "n_detections": int((det["plot_type"] == pt).sum()),
@@ -506,7 +511,9 @@ def build_ahdrift() -> dict:
              "n_plots": int(pday.loc[pday["plot_type"] == pt, "plot"]
                             .nunique()),
              "hut_days": int(sum(r["hut_days"] for r in effort_rows
-                                 if r["plot_type"] == pt))}
+                                 if r["plot_type"] == pt)),
+             "effort": int(sum(r["hut_days"] for r in effort_rows
+                               if r["plot_type"] == pt))}
             for pt in PLOT_TYPE_ORDER
         ],
         "species": species,
@@ -704,8 +711,7 @@ def build_camera_traps(loc: pd.DataFrame) -> tuple[dict, list, dict, dict]:
             "A Wildlife Insights sequence is one identification unit -- a "
             "burst of images of one species at one camera -- not a count of "
             "individual animals. Only human-reviewed sequences are counted; "
-            "vehicle, blank and human labels are excluded. Counts are not "
-            "corrected for survey effort; the detection-rate panel is."
+            "vehicle, blank and human labels are excluded."
         ),
         "n_species": len(species),
         "n_identified_sequences": int(len(sp)),
@@ -718,6 +724,7 @@ def build_camera_traps(loc: pd.DataFrame) -> tuple[dict, list, dict, dict]:
             "from the species chart."
         ),
         "by_class": by_class,
+        "effort_unit": "camera-days",
         "by_plot_type": [
             {"plot_type": pt,
              "n_sequences": int((sp["plot_type"] == pt).sum()),
@@ -727,7 +734,9 @@ def build_camera_traps(loc: pd.DataFrame) -> tuple[dict, list, dict, dict]:
              "n_sites": sum(1 for v in site_meta.values()
                             if v["plot_type"] == pt),
              "camera_days": round(sum(d for k, d in site_days.items()
-                                      if site_meta[k]["plot_type"] == pt), 1)}
+                                      if site_meta[k]["plot_type"] == pt), 1),
+             "effort": round(sum(d for k, d in site_days.items()
+                                 if site_meta[k]["plot_type"] == pt), 1)}
             for pt in PLOT_TYPE_ORDER
         ],
         "species": species,
@@ -1001,6 +1010,71 @@ def build_birdnet() -> dict:
                     for pt, arr in effort.items()}
     total_rec_hours = sum(sum(a) for a in effort_hours.values())
 
+    # ---- which half-hours the schedule actually sampled -------------------
+    # The recorders run a night schedule, not a 24-hour one, and the effort
+    # profile separates into three clean regimes: scheduled night bins carry
+    # 80-150 recorded hours each, the dawn-chorus hour reaches ~1,580, and the
+    # middle of the day sits on a flat ~32-hour plateau contributed by a
+    # handful of plots that also ran off-schedule daytime recordings.
+    #
+    # Those daytime bins must not be drawn. Dividing a handful of detections
+    # by a near-zero denominator produces a rate with no useful precision, and
+    # plotting it next to the dawn peak invites reading a sampling artefact as
+    # a behavioural one. The cut is placed in the gap between the two regimes
+    # rather than at a round number chosen by eye: the daytime plateau never
+    # exceeds ~2.1% of the peak bin and no scheduled bin falls below ~3.6%.
+    bin_total = [sum(effort[pt][b] for pt in effort) for b in range(ACT_BINS)]
+    peak = max(bin_total) if bin_total else 0.0
+    sampled = [1 if (peak and v >= ACT_MIN_EFFORT_FRACTION * peak) else 0
+               for v in bin_total]
+
+    # Clock extent of the sampled window, read as a run that may wrap midnight.
+    first_bin = last_bin = None
+    if any(sampled):
+        gaps, run = [], []
+        for b in range(ACT_BINS * 2):
+            i = b % ACT_BINS
+            if not sampled[i]:
+                run.append(i)
+            elif run:
+                gaps.append(run)
+                run = []
+        longest = max(gaps, key=len) if gaps else []
+        if longest:
+            first_bin = (longest[-1] + 1) % ACT_BINS
+            last_bin = (longest[0] - 1) % ACT_BINS
+        else:
+            first_bin, last_bin = 0, ACT_BINS - 1
+
+    def clock(b):
+        return f"{int(b * ACT_BIN_SECONDS // 3600):02d}:" \
+               f"{int(b * ACT_BIN_SECONDS % 3600 // 60):02d}"
+
+    # Files that started in an unsampled bin: the off-schedule daytime
+    # recordings, named so they are accounted for rather than silently cut.
+    off_plots = Counter()
+    n_off = 0
+    for fname in file_max:
+        h, m, _pt, plot, _date = file_meta[fname]
+        if not sampled[((h * 3600 + m * 60) % 86400) // ACT_BIN_SECONDS]:
+            off_plots[plot] += 1
+            n_off += 1
+
+    pct_covered = (100.0 * sum(v for b, v in enumerate(bin_total) if sampled[b])
+                   / sum(bin_total)) if sum(bin_total) else 0.0
+
+    # How many detections the activity panel therefore leaves out. Published
+    # rather than inferred: a reader comparing the activity panel against the
+    # species chart should be able to see the difference accounted for.
+    det_in = det_out = 0
+    for sp, per_pt in sp_act.items():
+        for _pt, arr in per_pt.items():
+            for b, v in enumerate(arr):
+                if sampled[b]:
+                    det_in += v
+                else:
+                    det_out += v
+
     # ---- per-species rows -------------------------------------------------
     species = []
     for sp, raw in sp_raw.most_common():
@@ -1116,11 +1190,79 @@ def build_birdnet() -> dict:
             for k in sorted({s["class"] for s in wildlife if s["class"]},
                             key=class_rank)
         ],
+        # Per-plot-type survey effort, so the species chart can be divided by
+        # it. Recording HOURS rather than recorder-days is the denominator
+        # that matches the detections: the schedule records a few hours a
+        # night, and dividing a detection count by whole days would imply far
+        # more listening than took place.
+        "by_plot_type": [
+            {"plot_type": pt,
+             "n_plots": sum(1 for p in plots if p["plot_type"] == pt),
+             "n_recording_days": sum(p["n_recording_days"] for p in plots
+                                     if p["plot_type"] == pt),
+             "recording_hours": round(sum(effort_hours.get(pt, [])), 1),
+             "effort": round(sum(effort_hours.get(pt, [])), 1),
+             "n_recordings": int(file_count.get(pt, 0)),
+             "n_detections": sum(s["by_plot_type"].get(pt, 0)
+                                 for s in wildlife)}
+            for pt in PLOT_TYPE_ORDER
+            if any(p["plot_type"] == pt for p in plots)
+        ],
+        "effort_unit": "recording-hours",
         "activity": {
             "bins": ACT_BINS,
             "bin_seconds": ACT_BIN_SECONDS,
             "effort_mode": "per_bin_hours",
             "effort_hours": effort_hours,
+            # 1 where the schedule sampled that half-hour, 0 where it did not.
+            # The frontend draws only the sampled run and normalises each curve
+            # over it, so a density here is a density over the recorded window
+            # and not over the 24-hour day.
+            "sampled": sampled,
+            "min_effort_fraction": ACT_MIN_EFFORT_FRACTION,
+            "window": {
+                "start_clock": clock(first_bin) if first_bin is not None else None,
+                "end_clock": (clock((last_bin + 1) % ACT_BINS)
+                              if last_bin is not None else None),
+                "n_bins": int(sum(sampled)),
+                "hours": round(sum(sampled) * ACT_BIN_SECONDS / 3600.0, 1),
+                "pct_effort_covered": round(pct_covered, 2),
+                "note": (
+                    "The recorders ran a night schedule rather than a "
+                    "24-hour one, so the activity curves are drawn only over "
+                    "the half-hours the schedule actually sampled. The "
+                    "schedule is solar-anchored, not a fixed clock time: the "
+                    "first recording of the night shifts about 1.7 hours "
+                    "later between March and August, tracking sunset. The "
+                    "window below is therefore the seasonal envelope of a "
+                    "moving window, and effort within it is uneven -- which "
+                    "is exactly what the per-recording-hour correction "
+                    "handles."
+                ),
+            },
+            "off_schedule": {
+                "n_recordings": int(n_off),
+                "n_plots": len(off_plots),
+                "plots": [p for p, _ in off_plots.most_common()],
+                "n_detections_in_window": int(det_in),
+                "n_detections_excluded": int(det_out),
+                "pct_detections_excluded": (
+                    round(100.0 * det_out / (det_in + det_out), 2)
+                    if (det_in + det_out) else 0.0),
+                "note": (
+                    f"{n_off:,} recordings at {len(off_plots)} plots "
+                    f"({', '.join(p for p, _ in off_plots.most_common(6))}) "
+                    f"started outside the scheduled window, almost all of "
+                    f"them hour-long daytime files. Their "
+                    f"{det_out:,} detections "
+                    f"({100.0 * det_out / max(det_in + det_out, 1):.1f}% of "
+                    f"the total) are "
+                    f"still counted in the species and rate panels; they are "
+                    f"excluded from the activity curves because a handful of "
+                    f"plots recording through the middle of the day cannot "
+                    f"describe the daily activity of the whole array."
+                ),
+            },
             "n_recordings": {k: int(v) for k, v in file_count.items()},
             "n_recordings_total": len(file_max),
             "n_recordings_long": int(n_long),
@@ -1133,9 +1275,11 @@ def build_birdnet() -> dict:
                 "recordings were therefore reduced to recorded hours per "
                 "half-hour of the clock, and the curves plot detections per "
                 "recording-hour, not raw detections. Each curve is scaled to "
-                "integrate to 1 over the 24-hour cycle so plot types are "
-                "comparable in shape. Bins with no recording effort carry no "
-                "curve."
+                "integrate to 1 over the recorded window so plot types are "
+                "comparable in shape. Because that window is a night rather "
+                "than a full cycle, the smoother does not wrap around "
+                "midnight: dusk and the following morning are at opposite "
+                "ends of the curve, not adjacent to one another."
             ),
             "duration_note": (
                 "Recording length is inferred per file from the largest "

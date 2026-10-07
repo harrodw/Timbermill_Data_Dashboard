@@ -20,7 +20,7 @@
 import {
   $, el, clear, fmtInt, fmtNum, fmtPct, isNum, classLabel, classRank,
   showPanelError, hidePanelError
-} from './data.js?v=a5de6b6827';
+} from './data.js?v=5344add485';
 
 const GROUP_BADGE = {
   validated: 'ok',

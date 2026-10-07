@@ -8,7 +8,7 @@
 <meta name="description" content="Preliminary, unvalidated wildlife sensor summaries from the Timbermill wind energy study, Chowan County, North Carolina.">
 
 <link rel="stylesheet" href="./assets/vendor/leaflet/leaflet.css">
-<link rel="stylesheet" href="./assets/css/dashboard.css?v=a5de6b6827">
+<link rel="stylesheet" href="./assets/css/dashboard.css?v=5344add485">
 </head>
 <body>
 
@@ -132,6 +132,13 @@
           <span>Class</span>
           <select id="species-class"></select>
         </label>
+        <label class="control" id="species-scale-wrap" hidden>
+          <span>Scale</span>
+          <select id="species-scale">
+            <option value="raw" selected>Raw counts</option>
+            <option value="effort">Per unit survey effort</option>
+          </select>
+        </label>
         <label class="control">
           <span>Show</span>
           <select id="species-topn">
@@ -177,6 +184,10 @@
         <label class="control control-wide">
           <span>Species</span>
           <select id="activity-species"></select>
+        </label>
+        <label class="control">
+          <span>Plot types</span>
+          <select id="activity-combined"></select>
         </label>
       </div>
       <div id="activity-stats" class="mini-stats"></div>
@@ -320,6 +331,6 @@
      reviewer opening index.html straight from disk). -->
 <script src="./assets/vendor/leaflet/leaflet.js" defer></script>
 <script src="./assets/vendor/plotly.min.js" charset="utf-8" defer></script>
-<script type="module" src="./assets/js/main.js?v=a5de6b6827"></script>
+<script type="module" src="./assets/js/main.js?v=5344add485"></script>
 </body>
 </html>
