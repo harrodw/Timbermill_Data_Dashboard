@@ -56,6 +56,7 @@ naive occupancy computable for the bucket cameras at all.
 | `build/make_photos.py` | yes | Photo selection, resize, EXIF strip. |
 | `build/make_spectrograms.py` | yes | ARU clip spectrograms + audio transcode. |
 | `build/make_media_json.py` | yes | Captions and the media manifest. |
+| `build/stamp_assets.py` | yes | Cache-busts the JS/CSS URLs. Run last. |
 | `build/photo_selection.json` | yes | Generated: which photo was published per taxon, with its Wildlife Insights identification. |
 | `docs/index.html` | yes | The dashboard. GitHub Pages serves this folder. |
 | `docs/assets/` | yes | CSS, six ES modules, vendored Leaflet + Plotly. |
@@ -89,6 +90,32 @@ python build/build_summaries.py    # again, so the manifest picks up media count
 `make_photos.py` strips EXIF by rebuilding each image pixel-by-pixel, which
 matters: camera-trap files can carry GPS and device serials. Run it on any new
 image before it reaches `docs/`.
+
+### Always finish with the asset stamp
+
+```bash
+python build/stamp_assets.py
+```
+
+`index.html` is revalidated on every load and the JSON is fetched with
+`cache: 'no-cache'`, but the six ES modules are ordinary subresources that a
+browser will keep serving from cache. After a push that changes both the
+summary schema and the code reading it, that gives **new HTML + new JSON + old
+JavaScript**, which does not throw — it silently draws an empty chart. It
+happened once: the species panel reported "no species rows with detections
+above zero" because the cached August module looked for `n_sequences` while the
+rebuilt AHDriFT file publishes `n_detections`, and the activity and rate panels
+stayed blank because that module has no code for them.
+
+`stamp_assets.py` appends `?v=<content-hash>` to every import between our own
+modules and to the two references in `index.html`, so a stale module is a URL
+the browser has never seen. It is idempotent and the token is a function of the
+code alone, so re-running without a change is a no-op. Vendored Leaflet and
+Plotly are deliberately left unstamped — they never change and staying cached
+is the point of vendoring them.
+
+If you ever see a panel that is empty rather than erroring, hard-reload
+(Ctrl/Cmd-Shift-R) first and check whether the stamp ran.
 
 ## BirdNET confidence cutoffs
 
@@ -186,6 +213,35 @@ the multi-species occupancy model is for.
 The acoustic view carries no rate chart. Recording hours are not comparable to
 trap-days, and a plot-level "occupancy" built from unvalidated classifier hits
 would not mean what the figure implies.
+
+## Basemaps
+
+A switcher in the top right of the map offers four options, all **keyless**:
+Esri topographic (the default — light and labelled, so the plot-type marker
+colours stay legible), Esri aerial imagery, OpenStreetMap, and No basemap.
+
+The aerial layer is worth knowing about: the stand boundaries, harvest openings
+and turbine clearings that the plot types are *defined* by are visible in it
+and invisible on a street map.
+
+This panel used CARTO's open `light_all` endpoint until CARTO moved its
+basemaps behind an API key. An unauthenticated request now returns a
+placeholder tile reading "API key required", which is worse than no basemap:
+it renders as content rather than failing, so the tile-error handler never
+fires and the map looks broken rather than degraded. Hence a switchable set —
+the next provider to change its terms costs a click, not a code edit. To change
+the default, edit `BASEMAP_DEFAULT` at the top of `docs/assets/js/map.js`.
+
+**OpenStreetMap is offered but is not the default, on purpose.** Those tiles
+come from volunteer infrastructure under a usage policy that asks not to be
+treated as a free CDN for websites, and a request without an identifying
+User-Agent is refused with a "403 Access blocked" tile — verified directly
+while testing this change. Fine for local use; the wrong thing to point a
+published, shared dashboard at.
+
+Sensor markers, the legend and the coordinate-precision note are all drawn from
+local data and stay correct with no basemap at all, which is the point of the
+"No basemap" option and of vendoring Leaflet.
 
 ## Map popups
 
@@ -351,6 +407,7 @@ cd /home/will/NCSU/Claude_Science/2026_Sensor_Dashboard
 
 # 1. rebuild (see "Rebuilding" above for when the media scripts are needed too)
 python build/build_summaries.py
+python build/stamp_assets.py      # never skip: this is what busts the JS cache
 
 # 2. check nothing private is staged — the only step worth not skipping
 git status --porcelain | grep -E '^\?\? (data|private)/' || echo "clean"
@@ -409,4 +466,5 @@ Field data and photographs: W. Harrod / NC State University.
 Wildlife identifications: project team via Wildlife Insights.
 Advisers: Christopher E. Moorman (NC State), Liz Kalies (The Nature Conservancy).
 Site access and support: Apex Clean Energy, Weyerhaeuser.
-Basemap: © OpenStreetMap contributors, © CARTO.
+Basemaps: © OpenStreetMap contributors; imagery and topographic tiles © Esri,
+Maxar, Earthstar Geographics and the GIS User Community.

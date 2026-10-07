@@ -20,7 +20,7 @@
 import {
   $, el, clear, fmtInt, fmtNum, fmtPct, isNum, classLabel, classRank,
   showPanelError, hidePanelError
-} from './data.js';
+} from './data.js?v=a5de6b6827';
 
 const GROUP_BADGE = {
   validated: 'ok',
@@ -249,6 +249,17 @@ export function renderValidation(ctx) {
   overall.appendChild(stat('Clips reviewed', fmtInt(v.n_clips_listened),
     `${fmtInt(v.n_clips_positive)} true, ${fmtInt(v.n_clips_negative)} false, ` +
     `${fmtInt(v.n_clips_skipped)} skipped`));
+
+  // Listening effort, reported separately from cutoff yield. More species were
+  // reviewed than produced a usable cutoff, and the cutoff count alone reads
+  // as though the rest had not been listened to.
+  if (isNum(v.n_species_reviewed)) {
+    overall.appendChild(stat('Species reviewed', fmtInt(v.n_species_reviewed),
+      isNum(v.n_species_full_quota)
+        ? `${fmtInt(v.n_species_full_quota)} at the full ` +
+          `${fmtInt(v.n_listened_per_species)} clips`
+        : null));
+  }
   // isNum: cutoff_median is null until at least one species is validated, and
   // Number(null) is a finite 0 that would print "median 0.00".
   overall.appendChild(stat('Cutoffs established', fmtInt(v.n_species_validated),

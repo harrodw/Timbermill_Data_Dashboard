@@ -19,7 +19,7 @@ import {
   plotTypeRank, classLabel, classRank, fillClassControl, activityCurve,
   sumBins, fmtClock, showPanelError, hidePanelError, showChartMessage,
   waitForGlobal
-} from './data.js';
+} from './data.js?v=a5de6b6827';
 
 const PLOTLY_CONFIG = {
   displayModeBar: true,

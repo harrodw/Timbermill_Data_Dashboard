@@ -97,6 +97,16 @@ ARU_SHORT_SECONDS = 300
 ARU_LONG_SECONDS = 3600
 ARU_DURATION_SPLIT = 310
 
+# --------------------------------------------------------------------------
+# BirdNET validation design
+# --------------------------------------------------------------------------
+# Clips reviewed per species when working through the queue, and the
+# true-positive probability the cutoff is read off at. Both are reported on the
+# dashboard rather than described in prose, so they live here as constants and
+# are not retyped into any note.
+VALIDATION_N_PER_SPECIES = 150
+VALIDATION_TARGET_P = 0.95
+
 # Non-wildlife / non-identification labels excluded from species tallies.
 NON_SPECIES_LABELS = {
     "no cv result", "blank", "vehicle", "animal", "unknown", "",
@@ -1139,10 +1149,20 @@ def build_birdnet() -> dict:
             ),
         },
         "validation": {
-            "design": "listen_150_per_species_then_fixed_cutoff",
-            "target_p": 0.95,
-            "n_listened_per_species": 150,
+            "design": "listen_n_per_species_then_fixed_cutoff",
+            "target_p": VALIDATION_TARGET_P,
+            "n_listened_per_species": VALIDATION_N_PER_SPECIES,
             "n_species_in_log": len(thresholds),
+            # Listening effort and cutoff yield are different counts and the
+            # panel reports both. 47 species produced a usable cutoff, but
+            # clips were reviewed for more than that: a species that never
+            # reached the target was still listened to, and reporting only the
+            # cutoff count understates the work done.
+            "n_species_reviewed": sum(
+                1 for s in species if s["validation"]["n_listened"] > 0),
+            "n_species_full_quota": sum(
+                1 for s in species
+                if s["validation"]["n_listened"] >= VALIDATION_N_PER_SPECIES),
             "n_species_validated": len(val),
             "n_species_no_cutoff": sum(1 for s in species
                                        if s["group"] == "no_cutoff"),
@@ -1447,6 +1467,23 @@ def main() -> int:
                        f"deployments but no row in "
                        f"cam_trap_locations_info.csv, so they contribute "
                        f"effort and detections but no marker."),
+        })
+    # A species carrying a threshold decision but no logged clip counts: the
+    # log says it was adjudicated, the counts say nothing was reviewed. One of
+    # the two is incomplete and only the researcher knows which.
+    unlogged = sorted(
+        s["species"] for s in birdnet["species"]
+        if s["group"] in ("validated", "no_cutoff")
+        and not s["validation"]["n_listened"])
+    if unlogged:
+        gaps.append({
+            "kind": "threshold_without_counts", "id": ", ".join(unlogged),
+            "detail": (f"{len(unlogged)} species ({', '.join(unlogged)}) carry "
+                       f"a threshold decision in BirdNet_Thresholds.csv but no "
+                       f"Positive/Negative/Skipped counts, so the clips behind "
+                       f"that decision are not recorded. The detection "
+                       f"filtering is unaffected; only the reported listening "
+                       f"effort is."),
         })
     if birdnet["labels_not_in_threshold_file"]:
         names = ", ".join(x["species"] for x

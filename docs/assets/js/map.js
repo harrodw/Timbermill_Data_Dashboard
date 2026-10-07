@@ -12,10 +12,23 @@
 import {
   $, el, clear, orderPlotTypes, plotColor, fmtInt,
   showPanelError, hidePanelError, waitForGlobal
-} from './data.js';
+} from './data.js?v=a5de6b6827';
 
 let map = null;
 let layer = null;
+
+/* Which basemap loads first. A light labelled base keeps the plot-type marker
+   colours legible, which is what this map is for; aerial imagery is one click
+   away for anyone who wants to see the stands. Change this string to any key
+   in the `layers` object built in renderMap().
+
+   Deliberately NOT OpenStreetMap's own tiles. Those are served by volunteer
+   infrastructure under a usage policy that asks not to be treated as a free
+   CDN for websites, and requests lacking an identifying User-Agent are
+   refused outright with a "403 Access blocked" tile. They stay available in
+   the switcher for local or occasional use; they are a poor choice to point a
+   published, shared dashboard at by default. */
+const BASEMAP_DEFAULT = 'Topographic (Esri)';
 
 /**
  * Pure selector: which location points belong to a view.
@@ -243,33 +256,72 @@ export async function renderMap(ctx) {
 
   if (!map) {
     map = L.map(container, { scrollWheelZoom: false, zoomSnap: 0.5 });
-    // Single hostname rather than Leaflet's {s} a/b/c shard placeholder: domain
-    // sharding gains nothing over HTTP/2 and costs two extra DNS lookups.
-    const tiles = L.tileLayer(
-      'https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
-        maxZoom: 18,
+
+    // Basemaps are offered as a switchable set, all of them KEYLESS.
+    //
+    // This panel previously used CARTO's open "light_all" endpoint. CARTO has
+    // since moved its basemaps behind an API key, and an unauthenticated
+    // request now returns a placeholder tile reading "API key required" --
+    // which is worse than no basemap, because it renders as content rather
+    // than failing and tripping the tileerror handler below. Offering a
+    // choice means the next provider to change its terms costs a click
+    // instead of a code edit, and "No basemap" makes the offline-correct
+    // state reachable deliberately rather than only by accident.
+    const layers = {};
+    layers['Topographic (Esri)'] = L.tileLayer(
+      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}', {
+        maxZoom: 19,
         attribution:
-          '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, ' +
-          '&copy; <a href="https://carto.com/attributions">CARTO</a>'
+          'Tiles &copy; <a href="https://www.esri.com/">Esri</a> and the GIS ' +
+          'User Community'
       });
-    // The basemap is the one remaining network dependency. Sensor markers,
+    // Aerial imagery earns its place here beyond cartographic taste: the
+    // stand boundaries, harvest openings and turbine clearings that the plot
+    // types are defined by are visible in it and invisible on a street map.
+    layers['Aerial imagery (Esri)'] = L.tileLayer(
+      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+        maxZoom: 19,
+        attribution:
+          'Imagery &copy; <a href="https://www.esri.com/">Esri</a>, Maxar, ' +
+          'Earthstar Geographics, and the GIS User Community'
+      });
+    // Available but not the default -- see the note on BASEMAP_DEFAULT.
+    layers['OpenStreetMap'] = L.tileLayer(
+      'https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution:
+          '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+      });
+    layers['No basemap'] = L.tileLayer('', { attribution: '' });
+
+    // The basemap is the only remaining network dependency. Sensor markers,
     // the legend and the precision note are all drawn from local data and
     // stay correct without it, so a tile failure gets a quiet caption rather
     // than an error: the map is still readable, just without the backdrop.
-    let tileWarned = false;
-    tiles.on('tileerror', () => {
-      if (tileWarned) return;
-      tileWarned = true;
-      const note = document.getElementById('map-basemap-note');
-      if (note) {
+    const note = document.getElementById('map-basemap-note');
+    const warned = new Set();
+    for (const [name, layer] of Object.entries(layers)) {
+      if (name === 'No basemap') continue;
+      layer.on('tileerror', () => {
+        if (warned.has(name)) return;
+        warned.add(name);
+        if (!note) return;
         note.hidden = false;
         note.textContent =
-          'Background map tiles could not be loaded (no network access). ' +
-          'Sensor positions, colours and the legend below are drawn from ' +
-          'local data and remain accurate.';
-      }
-    });
-    tiles.addTo(map);
+          `Background tiles from ${name} could not be loaded. Sensor ` +
+          `positions, colours and the legend below are drawn from local data ` +
+          `and remain accurate. If this is not simply a lack of network ` +
+          `access, pick a different basemap from the control in the top ` +
+          `right of the map.`;
+      });
+      layer.on('tileload', () => {
+        if (note && !warned.size) note.hidden = true;
+      });
+    }
+
+    layers[BASEMAP_DEFAULT].addTo(map);
+    L.control.layers(layers, null, { position: 'topright', collapsed: true })
+      .addTo(map);
     map.on('click', () => { /* keeps focus behaviour predictable on touch */ });
   }
   if (layer) { layer.remove(); layer = null; }

@@ -9,15 +9,15 @@
 
 import {
   $, el, clear, setText, fmtInt, fmtDays, tryLoadJSON, showPanelError
-} from './data.js';
-import { renderMap, invalidateMap } from './map.js';
+} from './data.js?v=a5de6b6827';
+import { renderMap, invalidateMap } from './map.js?v=a5de6b6827';
 import {
   renderEffort, renderSpecies, renderActivity, renderTree, fillGroupControl,
   resizeCharts, effortRowsForView, aruRowsForView, effortStatsFromRows,
   normalizeSpecies, speciesSource
-} from './charts.js';
-import { renderMedia, mediaCount } from './media.js';
-import { renderValidation, renderIdentification } from './validation.js';
+} from './charts.js?v=a5de6b6827';
+import { renderMedia, mediaCount } from './media.js?v=a5de6b6827';
+import { renderValidation, renderIdentification } from './validation.js?v=a5de6b6827';
 
 window.__dashboardBooted = true;
 
