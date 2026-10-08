@@ -47,7 +47,8 @@ import re
 import subprocess
 import sys
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
@@ -90,6 +91,48 @@ ACT_BIN_SECONDS = 86400 // ACT_BINS
 # scheduled night bins and the off-schedule daytime plateau: see the comment
 # in build_birdnet() where the mask is computed.
 ACT_MIN_EFFORT_FRACTION = 0.03
+
+# Minimum recording-hours a half-hour bin must carry before an acoustic
+# activity curve is drawn through it. Used instead of a share of the busiest
+# bin because it does not move between anchors: anchoring on sunset spreads
+# the dawn chorus over the ~3.2 h that night length varies across the season,
+# which lowers the peak without changing what was recorded. The choice is not
+# knife-edge -- any floor from 15 to 25 h gives the same window to within one
+# bin under all three anchors -- and at 20 h each anchor keeps ~94% of all
+# recorded time.
+ACT_MIN_BIN_HOURS = 20.0
+
+# ---------------------------------------------------------------- solar time
+# Activity can be binned against the clock or against a solar event. The study
+# area is one block of Chowan County, North Carolina; across the 50 plots the
+# spread in sunrise is a couple of seconds, so a single site position is used
+# for every plot rather than a per-plot computation that would imply a
+# precision the half-hour binning cannot carry.
+SITE_LAT = 36.13
+SITE_LON = -76.55
+SITE_TZ = -4.0                      # local standard offset used all season
+SOLAR_ZENITH = 90.833               # sun centre, refraction-corrected
+
+# Solar-anchored bins are rotated so that bin ACT_BINS//2 is the event itself.
+# Hours relative to the event are therefore (bin - ACT_BINS//2) * 0.5, which
+# runs -12 .. +11.5 and needs no wrapping to read.
+ACT_ANCHOR_BIN = ACT_BINS // 2
+ACT_ANCHORS = ("clock", "sunrise", "sunset")
+ANCHOR_LABELS = {
+    "clock": "Clock time",
+    "sunrise": "Hours from sunrise",
+    "sunset": "Hours from sunset",
+}
+ANCHOR_NOTE = (
+    "Detection times can be binned against the clock or against a solar "
+    "event. Clock time asks when in the day an animal was active; a solar "
+    "anchor asks where in the night or day it was active relative to the "
+    "light, which is what most activity is actually keyed to and what makes "
+    "March comparable with August. The anchors are not interchangeable: "
+    "anchoring on one end of the night sharpens that end and blurs the "
+    "other by however much night length changed over the season, so pick "
+    "the anchor nearest the behaviour being read."
+)
 
 # ARU recordings come in two lengths; the schedule runs 5-minute files through
 # most of the night and a 60-minute file over the dawn chorus. Detections are
@@ -289,13 +332,267 @@ def act_bin(hour, minute=0, second=0) -> int | None:
     return int(secs // ACT_BIN_SECONDS)
 
 
+@lru_cache(maxsize=None)
+def solar_hours(iso_date: str):
+    """(sunrise, sunset) for one date at the study site, in local decimal hours.
+
+    NOAA's standard sunrise equation. Returns (None, None) for a date that
+    cannot be parsed, so a missing date drops the detection from the
+    solar-anchored bins rather than putting it at an invented time.
+    """
+    try:
+        d = date.fromisoformat(str(iso_date)[:10])
+    except (TypeError, ValueError):
+        return (None, None)
+
+    out = []
+    for rising in (True, False):
+        n = d.timetuple().tm_yday
+        lng_hour = SITE_LON / 15.0
+        t = n + ((6 if rising else 18) - lng_hour) / 24.0
+        mean_anom = (0.9856 * t) - 3.289
+        true_long = (mean_anom
+                     + 1.916 * math.sin(math.radians(mean_anom))
+                     + 0.020 * math.sin(math.radians(2 * mean_anom))
+                     + 282.634) % 360
+        right_asc = math.degrees(
+            math.atan(0.91764 * math.tan(math.radians(true_long)))) % 360
+        right_asc += ((math.floor(true_long / 90) * 90)
+                      - (math.floor(right_asc / 90) * 90))
+        right_asc /= 15.0
+        sin_dec = 0.39782 * math.sin(math.radians(true_long))
+        cos_dec = math.cos(math.asin(sin_dec))
+        cos_h = ((math.cos(math.radians(SOLAR_ZENITH))
+                  - sin_dec * math.sin(math.radians(SITE_LAT)))
+                 / (cos_dec * math.cos(math.radians(SITE_LAT))))
+        if abs(cos_h) > 1:               # no rise or set at this latitude/date
+            out.append(None)
+            continue
+        hour_angle = (360 - math.degrees(math.acos(cos_h))) if rising \
+            else math.degrees(math.acos(cos_h))
+        hour_angle /= 15.0
+        out.append((hour_angle + right_asc - (0.06571 * t) - 6.622
+                    - lng_hour + SITE_TZ) % 24)
+    return (out[0], out[1])
+
+
+def anchor_bin(anchor: str, iso_date, secs) -> int | None:
+    """Seconds-past-local-midnight -> bin index for one anchor.
+
+    Solar bins are rotated so bin ACT_ANCHOR_BIN is the event. Taking the
+    offset modulo 24 h means a detection either side of midnight is measured
+    against the nearest occurrence of the event; the day-to-day drift in
+    sunrise is about a minute, far inside one half-hour bin.
+    """
+    if secs is None:
+        return None
+    s = int(secs) % 86400
+    if anchor == "clock":
+        return s // ACT_BIN_SECONDS
+    sunrise, sunset = solar_hours(iso_date)
+    ref = sunrise if anchor == "sunrise" else sunset
+    if ref is None:
+        return None
+    rel = (s - ref * 3600.0) % 86400
+    return (int(rel // ACT_BIN_SECONDS) + ACT_ANCHOR_BIN) % ACT_BINS
+
+
+def anchor_offset_seconds(anchor: str, iso_date, secs) -> float | None:
+    """Rotated seconds-into-the-cycle, for spreading a recording over bins."""
+    if secs is None:
+        return None
+    s = int(secs) % 86400
+    if anchor == "clock":
+        return float(s)
+    sunrise, sunset = solar_hours(iso_date)
+    ref = sunrise if anchor == "sunrise" else sunset
+    if ref is None:
+        return None
+    rel = (s - ref * 3600.0) % 86400
+    return (rel + ACT_ANCHOR_BIN * ACT_BIN_SECONDS) % 86400
+
+
+def bin_label(anchor: str, b: int) -> str:
+    """Human label for a bin edge, in that anchor's own units."""
+    if anchor == "clock":
+        return (f"{int(b * ACT_BIN_SECONDS // 3600):02d}:"
+                f"{int(b * ACT_BIN_SECONDS % 3600 // 60):02d}")
+    h = (b - ACT_ANCHOR_BIN) * (ACT_BIN_SECONDS / 3600.0)
+    if abs(h) < 1e-9:
+        return anchor
+    return f"{h:+.1f} h".replace(".0 h", " h")
+
+
 def empty_bins() -> list[int]:
     return [0] * ACT_BINS
+
+
+def empty_anchor_bins() -> dict:
+    return {a: [0] * ACT_BINS for a in ACT_ANCHORS}
 
 
 def pack_activity(d: dict) -> dict:
     """Drop all-zero plot-type rows so the published arrays stay small."""
     return {k: v for k, v in d.items() if any(v)}
+
+
+def pack_anchored_activity(d: dict) -> dict:
+    """{anchor: {plot_type: bins}} with empty rows and empty anchors dropped."""
+    out = {}
+    for anchor in ACT_ANCHORS:
+        packed = pack_activity(d.get(anchor, {}))
+        if packed:
+            out[anchor] = packed
+    return out
+
+
+def accumulate_activity(plot_types, hours, minutes, seconds, days) -> dict:
+    """Bin one species' detection times against every anchor at once.
+
+    Returns {anchor: {plot_type: [counts per bin]}}. A detection with no
+    usable time, no plot type, or (for the solar anchors) no usable date is
+    skipped for that anchor rather than placed at an assumed time.
+    """
+    act = {a: defaultdict(empty_bins) for a in ACT_ANCHORS}
+    for pt, h, m, s, day in zip(plot_types, hours, minutes, seconds, days):
+        if not pt or pd.isna(pt) or pd.isna(h):
+            continue
+        try:
+            secs = (int(h) * 3600
+                    + int(0 if pd.isna(m) else m) * 60
+                    + int(0 if pd.isna(s) else s))
+        except (TypeError, ValueError):
+            continue
+        for anchor in ACT_ANCHORS:
+            b = anchor_bin(anchor, day, secs)
+            if b is not None:
+                act[anchor][str(pt)][b] += 1
+    return act
+
+
+def window_extent(anchor: str, win: dict) -> dict:
+    """Published extent of a sampled window, in that anchor's own units.
+
+    For a solar anchor the window is reported in hours relative to the event.
+    A night window crosses the +/-12 h wrap, which would otherwise be written
+    as "+10 h to +1.5 h" -- true modulo 24, but unreadable. The representation
+    is chosen so the window CONTAINS the anchor, which turns that case into
+    "-14 h to +1.5 h": the night running up to the following sunrise. The
+    anchor is the one instant the window is guaranteed to span (the recorders
+    ran through both sunset and sunrise every night), so it is the stable
+    choice; picking the branch by which end is larger is not, because a
+    window straddling sunset already ends past +12 h legitimately.
+    """
+    first, last = win["first_bin"], win["last_bin"]
+    out = {
+        "start_bin": first,
+        "end_bin": last,
+        "n_bins": win["n_bins"],
+        "hours": win["hours"],
+        "pct_effort_covered": win["pct_effort_covered"],
+    }
+    if first is None or last is None:
+        out["start_label"] = out["end_label"] = None
+        return out
+    if anchor == "clock":
+        out["start_label"] = bin_label("clock", first)
+        out["end_label"] = bin_label("clock", (last + 1) % ACT_BINS)
+        return out
+
+    half = ACT_BIN_SECONDS / 3600.0
+    start_rel = (first - ACT_ANCHOR_BIN) * half
+    end_rel = start_rel + win["n_bins"] * half
+    shift = 0.0
+    if start_rel > 0.0:                     # window sits wholly after the event
+        shift = -24.0
+    elif end_rel < 0.0:                     # wholly before it
+        shift = 24.0
+    start_rel += shift
+    end_rel += shift
+    out["rel_shift_h"] = shift
+    out["start_rel_h"] = round(start_rel, 2)
+    out["end_rel_h"] = round(end_rel, 2)
+    out["start_label"] = f"{start_rel:+.1f} h".replace(".0 h", " h")
+    out["end_label"] = f"{end_rel:+.1f} h".replace(".0 h", " h")
+    return out
+
+
+def uniform_anchor_meta() -> dict:
+    """Anchor metadata for a sensor that ran continuously.
+
+    A camera watching around the clock contributes equally to every bin under
+    any anchor, so all 48 bins are sampled and the curve stays circular. Only
+    the x-axis meaning changes between anchors.
+    """
+    return {
+        a: {
+            "label": ANCHOR_LABELS[a],
+            "sampled": [1] * ACT_BINS,
+            "n_bins": ACT_BINS,
+            "hours": round(ACT_BINS * ACT_BIN_SECONDS / 3600.0, 2),
+            "pct_effort_covered": 100.0,
+            "anchor_bin": None if a == "clock" else ACT_ANCHOR_BIN,
+        }
+        for a in ACT_ANCHORS
+    }
+
+
+def derive_window(bin_total, min_fraction=None, min_absolute=None):
+    """Which bins the schedule sampled, and the extent of that run.
+
+    Two ways to call it, for two different jobs:
+
+    `min_fraction` marks a bin sampled at that share of the busiest bin. This
+    is used on the CLOCK profile of all recordings, where the three effort
+    regimes separate cleanly and the question is which recordings were on
+    schedule at all.
+
+    `min_absolute` marks a bin sampled when it carries that much effort
+    outright. This is used for the drawn window, because it is anchor
+    invariant: anchoring on sunset smears the dawn chorus over the hours that
+    night length varies, which lowers the peak and would move a
+    fraction-of-peak cut even though the recordings did not change.
+
+    The extent is read as the complement of the LONGEST unsampled run, so a
+    window that straddles the start of the cycle comes back as one contiguous
+    span rather than two.
+    """
+    if (min_fraction is None) == (min_absolute is None):
+        raise ValueError("pass exactly one of min_fraction / min_absolute")
+    peak = max(bin_total) if bin_total else 0.0
+    if min_absolute is not None:
+        sampled = [1 if v >= min_absolute else 0 for v in bin_total]
+    else:
+        sampled = [1 if (peak and v >= min_fraction * peak) else 0
+                   for v in bin_total]
+    first_bin = last_bin = None
+    if any(sampled):
+        gaps, run = [], []
+        for b in range(ACT_BINS * 2):
+            i = b % ACT_BINS
+            if not sampled[i]:
+                run.append(i)
+            elif run:
+                gaps.append(run)
+                run = []
+        longest = max(gaps, key=len) if gaps else []
+        if longest:
+            first_bin = (longest[-1] + 1) % ACT_BINS
+            last_bin = (longest[0] - 1) % ACT_BINS
+        else:
+            first_bin, last_bin = 0, ACT_BINS - 1
+    n_bins = sum(sampled)
+    pct = (100.0 * sum(v for b, v in enumerate(bin_total) if sampled[b])
+           / sum(bin_total)) if sum(bin_total) else 0.0
+    return {
+        "sampled": sampled,
+        "peak": peak,
+        "first_bin": first_bin,
+        "last_bin": last_bin,
+        "n_bins": n_bins,
+        "hours": round(n_bins * ACT_BIN_SECONDS / 3600.0, 2),
+        "pct_effort_covered": round(pct, 2),
+    }
 
 
 def latin_from_pairs(pairs) -> str | None:
@@ -402,6 +699,7 @@ def build_ahdrift() -> dict:
     det["hour"] = ts.dt.hour
     det["minute"] = ts.dt.minute
     det["second"] = ts.dt.second
+    det["day"] = ts.dt.strftime("%Y-%m-%d")
     n_no_time = int(ts.isna().sum())
 
     # ---- per-species rows -------------------------------------------------
@@ -422,13 +720,8 @@ def build_ahdrift() -> dict:
         for p, n in by_plot.items():
             point_counts[p][name] += int(n)
 
-        act = defaultdict(empty_bins)
-        for pt, h, m, s in zip(g["plot_type"], g["hour"], g["minute"],
-                               g["second"]):
-            b = act_bin(h, m, s)
-            if b is None or not pt:
-                continue
-            act[pt][b] += 1
+        act = accumulate_activity(g["plot_type"], g["hour"], g["minute"],
+                                  g["second"], g["day"])
 
         n_det = int(len(g))
         n_sites_det = int(g["plot"].nunique())
@@ -446,8 +739,9 @@ def build_ahdrift() -> dict:
             "n_sites_detected": n_sites_det,
             "detection_rate_per_100": (round(100 * n_det / total_hut_days, 3)
                                        if total_hut_days else None),
-            "activity": pack_activity(act),
-            "n_activity_binned": int(sum(sum(v) for v in act.values())),
+            "activity": pack_anchored_activity(act),
+            "n_activity_binned": int(sum(sum(v) for v
+                                         in act["clock"].values())),
         })
     species.sort(key=lambda r: -r["n_detections"])
 
@@ -542,6 +836,8 @@ def build_ahdrift() -> dict:
             "bins": ACT_BINS,
             "bin_seconds": ACT_BIN_SECONDS,
             "effort_mode": "uniform",
+            "anchors": uniform_anchor_meta(),
+            "anchor_note": ANCHOR_NOTE,
             "note": (
                 "Bucket cameras run continuously, so detection times need no "
                 "effort correction: every half-hour of the day was watched "
@@ -646,6 +942,7 @@ def build_camera_traps(loc: pd.DataFrame) -> tuple[dict, list, dict, dict]:
     ct["hour"] = cts.dt.hour
     ct["minute"] = cts.dt.minute
     ct["second"] = cts.dt.second
+    ct["day"] = cts.dt.strftime("%Y-%m-%d")
 
     keep = ct["common_name"].map(is_species_label)
     sp = ct.loc[keep].copy()
@@ -660,13 +957,8 @@ def build_camera_traps(loc: pd.DataFrame) -> tuple[dict, list, dict, dict]:
         for p, n in by_point.items():
             point_counts[p][name] += int(n)
 
-        act = defaultdict(empty_bins)
-        for pt, h, m, s in zip(g["plot_type"], g["hour"], g["minute"],
-                               g["second"]):
-            b = act_bin(h, m, s)
-            if b is None or not pt:
-                continue
-            act[pt][b] += 1
+        act = accumulate_activity(g["plot_type"], g["hour"], g["minute"],
+                                  g["second"], g["day"])
 
         n_det = int(len(g))
         det_sites = {k for k in by_point if k in site_days}
@@ -688,8 +980,9 @@ def build_camera_traps(loc: pd.DataFrame) -> tuple[dict, list, dict, dict]:
                                     if n_sites else None),
             "detection_rate_per_100": (round(100 * n_det / total_camera_days, 3)
                                        if total_camera_days else None),
-            "activity": pack_activity(act),
-            "n_activity_binned": int(sum(sum(v) for v in act.values())),
+            "activity": pack_anchored_activity(act),
+            "n_activity_binned": int(sum(sum(v) for v
+                                         in act["clock"].values())),
         })
     species.sort(key=lambda r: -r["n_sequences"])
 
@@ -761,6 +1054,8 @@ def build_camera_traps(loc: pd.DataFrame) -> tuple[dict, list, dict, dict]:
             "bins": ACT_BINS,
             "bin_seconds": ACT_BIN_SECONDS,
             "effort_mode": "uniform",
+            "anchors": uniform_anchor_meta(),
+            "anchor_note": ANCHOR_NOTE,
             "note": (
                 "Parallel cameras run continuously, so detection times need "
                 "no effort correction. Curves are kernel-smoothed half-hour "
@@ -907,7 +1202,8 @@ def build_birdnet() -> dict:
     sp_plots = defaultdict(set)
     sp_plot_type = defaultdict(Counter)
     sp_plot = defaultdict(Counter)
-    sp_act = defaultdict(lambda: defaultdict(empty_bins))
+    sp_act = defaultdict(
+        lambda: {x: defaultdict(empty_bins) for x in ACT_ANCHORS})
     conf_hist = Counter()            # 0.05-wide confidence bins, all species
     plot_dates = defaultdict(set)
     plot_type_of_plot = {}
@@ -972,15 +1268,22 @@ def build_birdnet() -> dict:
             for p, n in keep["Plot"].value_counts().items():
                 sp_plot[sp][str(p)] += int(n)
             if info["group"] != "other":
-                bins = ((pd.to_numeric(keep["Rec.Hour"], errors="coerce")
+                secs = ((pd.to_numeric(keep["Rec.Hour"], errors="coerce")
                          .fillna(0) * 3600
                          + pd.to_numeric(keep["Rec.Min"], errors="coerce")
                          .fillna(0) * 60
                          + pd.to_numeric(keep["Start.sec"], errors="coerce")
-                         .fillna(0)) % 86400 // ACT_BIN_SECONDS).astype(int)
-                for (pt, b), n in keep.assign(_b=bins).groupby(
-                        ["pt", "_b"]).size().items():
-                    sp_act[sp][str(pt)][int(b)] += int(n)
+                         .fillna(0)) % 86400).astype(int)
+                k = keep.assign(_s=secs, _d=keep["Date"].astype(str))
+                # Group by (plot type, date, second) once and bin the groups:
+                # the solar offset depends only on the date, so this collapses
+                # 3.5 M per-row solar lookups into one per distinct date.
+                sized = k.groupby(["pt", "_d", "_s"]).size()
+                for (pt, day, sec), n in sized.items():
+                    for anchor in ACT_ANCHORS:
+                        bb = anchor_bin(anchor, day, sec)
+                        if bb is not None:
+                            sp_act[sp][anchor][str(pt)][bb] += int(n)
 
         conf_hist.update((chunk["conf"] // 0.05).astype(int)
                          .value_counts().to_dict())
@@ -989,23 +1292,69 @@ def build_birdnet() -> dict:
             plot_type_of_plot[str(plot)] = str(pt)
 
     # ---- recording effort per half-hour bin, per plot type ----------------
-    effort = defaultdict(lambda: [0] * ACT_BINS)
+    # Spread each recording over the bins it actually covers, once per anchor.
+    # A file that starts 40 minutes before sunrise lands in different bins
+    # under the solar anchors than under the clock, so the denominator has to
+    # be rebuilt for each rather than rotated from the clock version: the
+    # rotation differs by date, and a season's dates do not share one offset.
+    def spread(target, pt, t, dur):
+        """Add one recording's seconds to the bins it covers."""
+        left = dur
+        while left > 0:
+            b = int(t // ACT_BIN_SECONDS) % ACT_BINS
+            room = (b + 1) * ACT_BIN_SECONDS - t
+            take = min(left, room)
+            target[pt][b] += take
+            t = (t + take) % 86400
+            left -= take
+
+    file_dur = {}
     file_count = defaultdict(int)
     n_long = 0
     for fname, mx in file_max.items():
-        h, m, pt, _plot, _date = file_meta[fname]
+        _h, _m, pt, _plot, _day = file_meta[fname]
         dur = ARU_LONG_SECONDS if mx > ARU_DURATION_SPLIT else ARU_SHORT_SECONDS
+        file_dur[fname] = dur
         n_long += dur == ARU_LONG_SECONDS
         file_count[pt] += 1
-        t = (h * 3600 + m * 60) % 86400
-        left = dur
-        while left > 0:
-            b = int(t // ACT_BIN_SECONDS)
-            room = (b + 1) * ACT_BIN_SECONDS - t
-            take = min(left, room)
-            effort[pt][b] += take
-            t = (t + take) % 86400
-            left -= take
+
+    # Whether a recording was on schedule is a property of the RECORDING, not
+    # of a bin, so it is settled once on the clock profile -- where the three
+    # effort regimes separate cleanly -- and that verdict is then reused for
+    # every anchor. Deriving it separately per anchor would re-apply a
+    # threshold calibrated on the clock profile to a smeared one: anchoring on
+    # sunset spreads the dawn chorus over the 3.2 h that night length varies,
+    # which pushes genuinely scheduled bins under the cut and truncates the
+    # window across the dawn peak.
+    clock_all = defaultdict(lambda: [0] * ACT_BINS)
+    for fname, dur in file_dur.items():
+        h, m, pt, _plot, _day = file_meta[fname]
+        spread(clock_all, pt, float((h * 3600 + m * 60) % 86400), dur)
+    clock_total = [sum(clock_all[pt][b] for pt in clock_all)
+                   for b in range(ACT_BINS)]
+    clock_mask = derive_window(
+        clock_total, min_fraction=ACT_MIN_EFFORT_FRACTION)["sampled"]
+    on_schedule = {
+        fname for fname in file_dur
+        if clock_mask[((file_meta[fname][0] * 3600 + file_meta[fname][1] * 60)
+                       % 86400) // ACT_BIN_SECONDS]
+    }
+
+    effort_by_anchor = {a: defaultdict(lambda: [0] * ACT_BINS)
+                        for a in ACT_ANCHORS}
+    sched_by_anchor = {a: defaultdict(lambda: [0] * ACT_BINS)
+                       for a in ACT_ANCHORS}
+    for fname, dur in file_dur.items():
+        h, m, pt, _plot, day = file_meta[fname]
+        start = (h * 3600 + m * 60) % 86400
+        for anchor in ACT_ANCHORS:
+            t = anchor_offset_seconds(anchor, day, start)
+            if t is None:
+                continue
+            spread(effort_by_anchor[anchor], pt, t, dur)
+            if fname in on_schedule:
+                spread(sched_by_anchor[anchor], pt, t, dur)
+    effort = effort_by_anchor["clock"]
     effort_hours = {pt: [round(s / 3600.0, 3) for s in arr]
                     for pt, arr in effort.items()}
     total_rec_hours = sum(sum(a) for a in effort_hours.values())
@@ -1023,57 +1372,77 @@ def build_birdnet() -> dict:
     # a behavioural one. The cut is placed in the gap between the two regimes
     # rather than at a round number chosen by eye: the daytime plateau never
     # exceeds ~2.1% of the peak bin and no scheduled bin falls below ~3.6%.
-    bin_total = [sum(effort[pt][b] for pt in effort) for b in range(ACT_BINS)]
-    peak = max(bin_total) if bin_total else 0.0
-    sampled = [1 if (peak and v >= ACT_MIN_EFFORT_FRACTION * peak) else 0
-               for v in bin_total]
+    anchor_meta = {}
+    off_counters = {}
+    for anchor in ACT_ANCHORS:
+        eff_a = effort_by_anchor[anchor]
+        sch_a = sched_by_anchor[anchor]
+        # The window is the span the SCHEDULED recordings cover under this
+        # anchor; the denominator inside it still counts every recorded
+        # second, including any off-schedule time that happens to fall there.
+        sched_total = [sum(sch_a[pt][b] for pt in sch_a)
+                       for b in range(ACT_BINS)]
+        win = derive_window(
+            sched_total, min_absolute=ACT_MIN_BIN_HOURS * 3600.0)
+        samp = win["sampled"]
+        bin_tot_a = [sum(eff_a[pt][b] for pt in eff_a) for b in range(ACT_BINS)]
+        win["pct_effort_covered"] = round(
+            100.0 * sum(v for b, v in enumerate(bin_tot_a) if samp[b])
+            / sum(bin_tot_a), 2) if sum(bin_tot_a) else 0.0
 
-    # Clock extent of the sampled window, read as a run that may wrap midnight.
-    first_bin = last_bin = None
-    if any(sampled):
-        gaps, run = [], []
-        for b in range(ACT_BINS * 2):
-            i = b % ACT_BINS
-            if not sampled[i]:
-                run.append(i)
-            elif run:
-                gaps.append(run)
-                run = []
-        longest = max(gaps, key=len) if gaps else []
-        if longest:
-            first_bin = (longest[-1] + 1) % ACT_BINS
-            last_bin = (longest[0] - 1) % ACT_BINS
-        else:
-            first_bin, last_bin = 0, ACT_BINS - 1
+        # The off-schedule recordings, named so they are accounted for rather
+        # than silently cut. The set is the same under every anchor by
+        # construction; the per-plot tally is reported from it.
+        off_a = Counter()
+        for fname in file_dur:
+            if fname not in on_schedule:
+                off_a[file_meta[fname][3]] += 1
+
+        # How many detections the activity panel therefore leaves out.
+        # Published rather than inferred: a reader comparing the activity
+        # panel against the species chart can see the difference accounted for.
+        d_in = d_out = 0
+        for _sp, per_anchor in sp_act.items():
+            for _pt, arr in per_anchor[anchor].items():
+                for b, v in enumerate(arr):
+                    if samp[b]:
+                        d_in += v
+                    else:
+                        d_out += v
+
+        off_counters[anchor] = off_a
+        anchor_meta[anchor] = {
+            "label": ANCHOR_LABELS[anchor],
+            "sampled": samp,
+            "anchor_bin": None if anchor == "clock" else ACT_ANCHOR_BIN,
+            "effort": {pt: [round(s / 3600.0, 3) for s in arr]
+                       for pt, arr in eff_a.items()},
+            "window": window_extent(anchor, win),
+            "off_schedule": {
+                "n_recordings": int(sum(off_a.values())),
+                "n_plots": len(off_a),
+                "plots": [p for p, _ in off_a.most_common()],
+                "n_detections_in_window": int(d_in),
+                "n_detections_excluded": int(d_out),
+                "pct_detections_excluded": (round(100.0 * d_out / (d_in + d_out), 2)
+                                            if (d_in + d_out) else 0.0),
+            },
+        }
+
+    # The clock anchor stays the one the surrounding payload reports, so the
+    # existing summary fields keep their published meaning.
+    clock_meta = anchor_meta["clock"]
+    sampled = clock_meta["sampled"]
+    off_plots = off_counters["clock"]
+    n_off = clock_meta["off_schedule"]["n_recordings"]
+    pct_covered = clock_meta["window"]["pct_effort_covered"]
+    det_in = clock_meta["off_schedule"]["n_detections_in_window"]
+    det_out = clock_meta["off_schedule"]["n_detections_excluded"]
+    first_bin = clock_meta["window"]["start_bin"]
+    last_bin = clock_meta["window"]["end_bin"]
 
     def clock(b):
-        return f"{int(b * ACT_BIN_SECONDS // 3600):02d}:" \
-               f"{int(b * ACT_BIN_SECONDS % 3600 // 60):02d}"
-
-    # Files that started in an unsampled bin: the off-schedule daytime
-    # recordings, named so they are accounted for rather than silently cut.
-    off_plots = Counter()
-    n_off = 0
-    for fname in file_max:
-        h, m, _pt, plot, _date = file_meta[fname]
-        if not sampled[((h * 3600 + m * 60) % 86400) // ACT_BIN_SECONDS]:
-            off_plots[plot] += 1
-            n_off += 1
-
-    pct_covered = (100.0 * sum(v for b, v in enumerate(bin_total) if sampled[b])
-                   / sum(bin_total)) if sum(bin_total) else 0.0
-
-    # How many detections the activity panel therefore leaves out. Published
-    # rather than inferred: a reader comparing the activity panel against the
-    # species chart should be able to see the difference accounted for.
-    det_in = det_out = 0
-    for sp, per_pt in sp_act.items():
-        for _pt, arr in per_pt.items():
-            for b, v in enumerate(arr):
-                if sampled[b]:
-                    det_in += v
-                else:
-                    det_out += v
+        return bin_label("clock", b)
 
     # ---- per-species rows -------------------------------------------------
     species = []
@@ -1096,7 +1465,8 @@ def build_birdnet() -> dict:
             "n_plots": len(sp_plots[sp]),
             "by_plot_type": {k: int(v) for k, v in sp_plot_type[sp].items()},
             "by_plot": {k: int(v) for k, v in sorted(sp_plot[sp].items())},
-            "activity": pack_activity(sp_act[sp]) if sp in sp_act else {},
+            "activity": (pack_anchored_activity(sp_act[sp])
+                         if sp in sp_act else {}),
             "validation": {
                 "n_listened": n_listened,
                 "n_positive": info["n_positive"],
@@ -1214,12 +1584,23 @@ def build_birdnet() -> dict:
             "bin_seconds": ACT_BIN_SECONDS,
             "effort_mode": "per_bin_hours",
             "effort_hours": effort_hours,
+            "anchors": anchor_meta,
+            "anchor_note": ANCHOR_NOTE,
+            "solar_note": (
+                f"Solar times are computed for the study site "
+                f"({SITE_LAT:.2f} N, {abs(SITE_LON):.2f} W) with the NOAA "
+                f"sunrise equation, one value per date. Across the plots the "
+                f"spread in sunrise is a few seconds, well inside one "
+                f"half-hour bin, so a single site position is used rather "
+                f"than a per-plot calculation."
+            ),
             # 1 where the schedule sampled that half-hour, 0 where it did not.
             # The frontend draws only the sampled run and normalises each curve
             # over it, so a density here is a density over the recorded window
             # and not over the 24-hour day.
             "sampled": sampled,
             "min_effort_fraction": ACT_MIN_EFFORT_FRACTION,
+            "min_bin_hours": ACT_MIN_BIN_HOURS,
             "window": {
                 "start_clock": clock(first_bin) if first_bin is not None else None,
                 "end_clock": (clock((last_bin + 1) % ACT_BINS)
@@ -1253,10 +1634,7 @@ def build_birdnet() -> dict:
                     f"{n_off:,} recordings at {len(off_plots)} plots "
                     f"({', '.join(p for p, _ in off_plots.most_common(6))}) "
                     f"started outside the scheduled window, almost all of "
-                    f"them hour-long daytime files. Their "
-                    f"{det_out:,} detections "
-                    f"({100.0 * det_out / max(det_in + det_out, 1):.1f}% of "
-                    f"the total) are "
+                    f"them hour-long daytime files. Their detections are "
                     f"still counted in the species and rate panels; they are "
                     f"excluded from the activity curves because a handful of "
                     f"plots recording through the middle of the day cannot "
@@ -1277,9 +1655,9 @@ def build_birdnet() -> dict:
                 "recording-hour, not raw detections. Each curve is scaled to "
                 "integrate to 1 over the recorded window so plot types are "
                 "comparable in shape. Because that window is a night rather "
-                "than a full cycle, the smoother does not wrap around "
-                "midnight: dusk and the following morning are at opposite "
-                "ends of the curve, not adjacent to one another."
+                "than a full cycle, the smoother does not wrap: dusk and the "
+                "following morning are at opposite ends of the curve, not "
+                "adjacent to one another."
             ),
             "duration_note": (
                 "Recording length is inferred per file from the largest "

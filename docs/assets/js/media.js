@@ -11,7 +11,7 @@
 import {
   $, el, clear, fmtInt, fmtNum, plotColor, orderPlotTypes, classLabel,
   classRank, showPanelError, hidePanelError
-} from './data.js?v=5344add485';
+} from './data.js?v=17f780a779';
 
 let lightboxBound = false;
 

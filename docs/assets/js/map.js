@@ -12,7 +12,7 @@
 import {
   $, el, clear, orderPlotTypes, plotColor, fmtInt,
   showPanelError, hidePanelError, waitForGlobal
-} from './data.js?v=5344add485';
+} from './data.js?v=17f780a779';
 
 let map = null;
 let layer = null;

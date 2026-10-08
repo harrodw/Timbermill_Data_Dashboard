@@ -9,15 +9,15 @@
 
 import {
   $, el, clear, setText, fmtInt, fmtDays, tryLoadJSON, showPanelError
-} from './data.js?v=5344add485';
-import { renderMap, invalidateMap } from './map.js?v=5344add485';
+} from './data.js?v=17f780a779';
+import { renderMap, invalidateMap } from './map.js?v=17f780a779';
 import {
   renderEffort, renderSpecies, renderActivity, renderTree, fillGroupControl,
   resizeCharts, effortRowsForView, aruRowsForView, effortStatsFromRows,
   normalizeSpecies, speciesSource
-} from './charts.js?v=5344add485';
-import { renderMedia, mediaCount } from './media.js?v=5344add485';
-import { renderValidation, renderIdentification } from './validation.js?v=5344add485';
+} from './charts.js?v=17f780a779';
+import { renderMedia, mediaCount } from './media.js?v=17f780a779';
+import { renderValidation, renderIdentification } from './validation.js?v=17f780a779';
 
 window.__dashboardBooted = true;
 
@@ -48,7 +48,7 @@ const state = {
     bnGroup: 'validated',
     speciesClass: 'all', speciesScale: 'raw',
     activityClass: 'all', activitySpecies: 'all',
-    activityCombined: 'separate',
+    activityCombined: 'separate', activityAnchor: 'clock',
     treeClass: 'all', treeTopN: '25'
   }
 };
@@ -485,6 +485,7 @@ async function boot() {
   bind('#activity-class', 'activityClass', ['activity'], ['activitySpecies']);
   bind('#activity-species', 'activitySpecies', ['activity']);
   bind('#activity-combined', 'activityCombined', ['activity']);
+  bind('#activity-anchor', 'activityAnchor', ['activity']);
   bind('#tree-class', 'treeClass', ['tree']);
   bind('#tree-topn', 'treeTopN', ['tree']);
 

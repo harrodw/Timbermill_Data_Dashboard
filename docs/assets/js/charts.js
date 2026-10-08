@@ -19,7 +19,7 @@ import {
   plotTypeRank, classLabel, classRank, fillClassControl, activityCurve,
   sumBins, fmtClock, showPanelError, hidePanelError, showChartMessage,
   waitForGlobal
-} from './data.js?v=5344add485';
+} from './data.js?v=17f780a779';
 
 const PLOTLY_CONFIG = {
   displayModeBar: true,
@@ -620,7 +620,49 @@ export function activityMeta(view, sources) {
  * would weight a plot type with 900 recording-hours the same as one with
  * 4,900 and is not a rate of anything.
  */
-export function activityTraces(list, meta, speciesName, combined) {
+/**
+ * The per-anchor slice of a file's .activity block.
+ *
+ * Falls back to the clock anchor, then to the block itself, so a summary
+ * written before anchors existed still renders.
+ */
+const ACT_ANCHOR_ORDER = ['clock', 'sunrise', 'sunset'];
+const ANCHOR_FALLBACK = {
+  clock: 'Clock time',
+  sunrise: 'Hours from sunrise',
+  sunset: 'Hours from sunset'
+};
+const ANCHOR_EVENT = { sunrise: 'sunrise', sunset: 'sunset' };
+const eventNameOf = k => ANCHOR_EVENT[k] || 'the anchor';
+
+/** Signed hours relative to a solar event, for an axis label. */
+function fmtRelHours(r) {
+  const v = Math.round(r * 10) / 10;
+  if (Math.abs(v) < 1e-9) return '0 h';
+  const body = Number.isInteger(v) ? String(v) : v.toFixed(1);
+  return (v > 0 ? '+' : '') + body + ' h';
+}
+
+export function anchorMeta(meta, anchor) {
+  if (!meta) return null;
+  const anchors = meta.anchors;
+  if (anchors && typeof anchors === 'object') {
+    return anchors[anchor] || anchors.clock || null;
+  }
+  return meta;
+}
+
+/** One species' bins for one anchor. */
+function actOf(s, anchor) {
+  const act = s.activity || {};
+  // Anchored files nest by anchor; older ones are a bare {plot_type: bins}.
+  if (act[anchor] && typeof act[anchor] === 'object') return act[anchor];
+  if (act.clock && typeof act.clock === 'object') return act.clock;
+  if (act.sunrise || act.sunset) return {};
+  return act;
+}
+
+export function activityTraces(list, meta, speciesName, combined, anchor) {
   if (!meta || !Number.isFinite(Number(meta.bins))) return [];
   const nBins = Number(meta.bins);
   const chosen = (speciesName && speciesName !== 'all')
@@ -628,14 +670,17 @@ export function activityTraces(list, meta, speciesName, combined) {
     : list;
   if (!chosen.length) return [];
 
-  const effortHours = (meta.effort_mode === 'per_bin_hours' && meta.effort_hours)
-    ? meta.effort_hours : null;
-  const sampled = Array.isArray(meta.sampled) ? meta.sampled : null;
-  const types = orderPlotTypes(chosen.flatMap(s => Object.keys(s.activity || {})));
+  const am = anchorMeta(meta, anchor);
+  const effortHours = (meta.effort_mode === 'per_bin_hours')
+    ? ((am && am.effort) || meta.effort_hours || null) : null;
+  const sampled = (am && Array.isArray(am.sampled)) ? am.sampled
+    : (Array.isArray(meta.sampled) ? meta.sampled : null);
+  const types = orderPlotTypes(
+    chosen.flatMap(s => Object.keys(actOf(s, anchor))));
 
   if (combined) {
     const counts = sumBins(
-      types.flatMap(pt => chosen.map(s => (s.activity || {})[pt])), nBins);
+      types.flatMap(pt => chosen.map(s => actOf(s, anchor)[pt])), nBins);
     const effort = effortHours
       ? sumBins(types.map(pt => effortHours[pt]), nBins) : null;
     const curve = activityCurve(counts, effort, sampled);
@@ -648,14 +693,14 @@ export function activityTraces(list, meta, speciesName, combined) {
       effort,
       n: curve.n,
       n_species: chosen.filter(
-        s => Object.keys(s.activity || {}).length).length,
+        s => Object.keys(actOf(s, anchor)).length).length,
       n_plot_types: types.length
     }];
   }
 
   const out = [];
   for (const pt of types) {
-    const counts = sumBins(chosen.map(s => (s.activity || {})[pt]), nBins);
+    const counts = sumBins(chosen.map(s => actOf(s, anchor)[pt]), nBins);
     const curve = activityCurve(counts, effortHours ? effortHours[pt] : null,
                                 sampled);
     if (!curve.ok) continue;
@@ -666,19 +711,19 @@ export function activityTraces(list, meta, speciesName, combined) {
       counts,
       effort: effortHours ? effortHours[pt] : null,
       n: curve.n,
-      n_species: chosen.filter(s => (s.activity || {})[pt]).length
+      n_species: chosen.filter(s => actOf(s, anchor)[pt]).length
     });
   }
   return out;
 }
 
 /** Species with enough binned detections to carry their own curve. */
-export function activitySpeciesOptions(list, minN) {
+export function activitySpeciesOptions(list, minN, anchor) {
   const floor = Number.isFinite(Number(minN)) ? Number(minN) : 1;
   return (list || [])
     .map(s => ({
       name: s.name,
-      n: Object.values(s.activity || {})
+      n: Object.values(actOf(s, anchor))
         .reduce((a, arr) => a + (arr || []).reduce((x, y) => x + (Number(y) || 0), 0), 0)
     }))
     .filter(s => s.n >= floor)
@@ -721,9 +766,43 @@ export async function renderActivity(ctx) {
   // Species offered individually: 20 binned detections is the floor at which
   // a smoothed curve says anything at all. Below it the interval is wider
   // than the curve and the shape is noise.
-  const options = activitySpeciesOptions(list, 20);
+  const options = activitySpeciesOptions(list, 20, controls.activityAnchor);
   controls.activitySpecies =
     fillActivitySpeciesControl($('#activity-species'), options, controls.activitySpecies);
+
+  // Which anchor the file actually carries. A summary without an anchors
+  // block only supports the clock, and the control is hidden rather than
+  // offering choices that would silently fall back.
+  const anchorsAvail = (meta.anchors && typeof meta.anchors === 'object')
+    ? ACT_ANCHOR_ORDER.filter(k => meta.anchors[k]) : ['clock'];
+  if (!anchorsAvail.includes(controls.activityAnchor)) {
+    controls.activityAnchor = anchorsAvail[0] || 'clock';
+  }
+  const anchorKey = controls.activityAnchor;
+  const anchorSel = $('#activity-anchor');
+  if (anchorSel) {
+    const wrap = anchorSel.closest('.control');
+    if (wrap) wrap.hidden = anchorsAvail.length < 2;
+    if (anchorSel.options.length !== anchorsAvail.length) {
+      clear(anchorSel);
+      for (const k of anchorsAvail) {
+        const o = el('option', null,
+          (meta.anchors && meta.anchors[k] && meta.anchors[k].label)
+            || ANCHOR_FALLBACK[k] || k);
+        o.value = k;
+        anchorSel.appendChild(o);
+      }
+    }
+    anchorSel.value = anchorKey;
+  }
+  const am = anchorMeta(meta, anchorKey);
+  // x values are anchored hours; under a solar anchor they read as hours from
+  // the event once shifted onto the branch that contains it.
+  const solar = anchorKey === 'sunrise' || anchorKey === 'sunset';
+  const relShift = (am && am.window && isNum(am.window.rel_shift_h))
+    ? Number(am.window.rel_shift_h) : 0;
+  const toRel = h => h - 12 + relShift;
+  const fmtAxis = h => (solar ? fmtRelHours(toRel(h)) : fmtClock(h));
 
   const combined = controls.activityCombined === 'combined';
   const combinedSel = $('#activity-combined');
@@ -736,21 +815,25 @@ export async function renderActivity(ctx) {
     }
     combinedSel.value = controls.activityCombined || 'separate';
   }
-  const traces = activityTraces(list, meta, controls.activitySpecies, combined);
+  const traces = activityTraces(list, meta, controls.activitySpecies,
+                                combined, anchorKey);
 
   const sub = $('#activity-sub');
   if (sub) {
     const what = view.speciesKind === 'birdnet' ? 'vocalizations' : 'detections';
-    const win = meta.window || null;
+    const win = (am && am.window) || null;
+    const when = solar
+      ? `Time of ${what} relative to ${eventNameOf(anchorKey)}, `
+      : `Time of day of ${what}, `;
     sub.textContent =
-      `Time of day of ${what}, ` +
+      when +
       (combined ? 'pooled across all plot types. ' : 'one curve per plot type. ') +
       (meta.effort_mode === 'per_bin_hours'
         ? 'Plotted as detections per recording-hour, because recording effort is far from even across the night.'
         : 'Cameras ran continuously, so no effort correction is needed.') +
-      (win && win.start_clock
+      (win && win.start_label && win.n_bins < Number(meta.bins)
         ? ` Drawn only over the ${win.hours} h the schedule actually sampled ` +
-          `(${win.start_clock}\u2013${win.end_clock}), which carries ` +
+          `(${win.start_label}\u2013${win.end_label}), which carries ` +
           `${win.pct_effort_covered}% of all recording effort; each curve ` +
           `integrates to 1 over that window.`
         : ' Each curve integrates to 1 over the 24-hour cycle.') +
@@ -761,11 +844,27 @@ export async function renderActivity(ctx) {
   if (noteEl) {
     clear(noteEl);
     if (meta.note) noteEl.appendChild(el('span', null, meta.note));
+    if (meta.anchor_note) {
+      noteEl.appendChild(el('p', 'panel-note', meta.anchor_note));
+    }
+    if (solar && meta.solar_note) {
+      noteEl.appendChild(el('p', 'panel-note', meta.solar_note));
+    }
     if (meta.window && meta.window.note) {
       noteEl.appendChild(el('p', 'panel-note', meta.window.note));
     }
     if (meta.off_schedule && meta.off_schedule.note) {
       noteEl.appendChild(el('p', 'panel-note', meta.off_schedule.note));
+    }
+    // The excluded share depends on the anchor, because the window does.
+    const offA = am && am.off_schedule;
+    if (offA && offA.n_detections_excluded > 0) {
+      noteEl.appendChild(el('p', 'panel-note',
+        `Under this anchor the drawn window holds ` +
+        `${fmtInt(offA.n_detections_in_window)} detections and leaves out ` +
+        `${fmtInt(offA.n_detections_excluded)} ` +
+        `(${offA.pct_detections_excluded}%), all of them from the ` +
+        `off-schedule recordings named above.`));
     }
     if (meta.duration_note) noteEl.appendChild(el('p', 'panel-note', meta.duration_note));
     if (meta.timestamp_note) noteEl.appendChild(el('p', 'panel-note', meta.timestamp_note));
@@ -777,11 +876,14 @@ export async function renderActivity(ctx) {
       'same kernel; a band wider than the curve means the shape is carried by too ' +
       'few detections to read. ' +
       (wrapped
-        ? 'Curves are wrapped at midnight, so a peak either side of 00:00 is ' +
-          'one peak, not two.'
-        : 'Because the recorders sampled a night rather than the whole clock, ' +
-          'the curves are not wrapped at midnight: the left and right ends are ' +
-          'dusk and the following morning, roughly 15 hours apart.')));
+        ? (solar
+            ? `Curves wrap at 12 hours either side of ${eventNameOf(anchorKey)}, ` +
+              'so a peak spanning that point is one peak, not two.'
+            : 'Curves are wrapped at midnight, so a peak either side of 00:00 ' +
+              'is one peak, not two.')
+        : 'Because the recorders sampled a night rather than the whole cycle, ' +
+          'the curves are not wrapped: the left and right ends are dusk and ' +
+          'the following morning, roughly 15 hours apart.')));
   }
 
   if (!traces.length) {
@@ -818,7 +920,7 @@ export async function renderActivity(ctx) {
       name: `${t.plot_type} (n = ${fmtInt(t.n)})`,
       x: t.curve.x, y: t.curve.y,
       line: { color, width: 2.4, shape: 'spline', smoothing: 0.5 },
-      customdata: t.curve.x.map((h, i) => [fmtClock(h), t.curve.lo[i], t.curve.hi[i]]),
+      customdata: t.curve.x.map((h, i) => [fmtAxis(h), t.curve.lo[i], t.curve.hi[i]]),
       hovertemplate:
         `<b>${t.plot_type}</b><br>%{customdata[0]}<br>density %{y:.4f} ` +
         `(%{customdata[1]:.4f}\u2013%{customdata[2]:.4f})<extra></extra>`
@@ -827,18 +929,44 @@ export async function renderActivity(ctx) {
 
   // The axis follows the window the schedule sampled. For continuously
   // running cameras that is the whole day; for the ARUs it is dusk to morning,
-  // which straddles midnight, so the hours run past 24 and the tick labels are
-  // relabelled modulo 24 rather than the series being cut in two.
+  // which straddles midnight, so the hours run past 24 rather than the series
+  // being cut in two, and the tick labels are rewritten.
+  //
+  // Under a solar anchor the same x values mean hours from the event. Bins are
+  // published already rotated so the event sits at bin ACT_ANCHOR_BIN, i.e.
+  // at x = 12; rel_shift_h then picks the 24-hour branch that puts the event
+  // inside the window, which is what turns a night reading "+10 h to +1.5 h"
+  // into "-14 h to +1.5 h".
   const ref = traces[0].curve;
   const x0 = Number.isFinite(ref.startHour) ? ref.startHour : 0;
   const x1 = Number.isFinite(ref.endHour) ? ref.endHour : 24;
   const step = (x1 - x0) > 18 ? 4 : 2;
   const ticks = [];
-  for (let h = Math.ceil(x0 / step) * step; h <= x1 + 1e-9; h += step) ticks.push(h);
+  if (solar) {
+    // Anchor the tick ladder on the event itself so 0 is always labelled.
+    const r0 = toRel(x0);
+    const r1 = toRel(x1);
+    for (let r = Math.ceil(r0 / step) * step; r <= r1 + 1e-9; r += step) {
+      ticks.push(r + 12 - relShift);
+    }
+  } else {
+    for (let h = Math.ceil(x0 / step) * step; h <= x1 + 1e-9; h += step) {
+      ticks.push(h);
+    }
+  }
   const windowed = !ref.circular;
-  const axisTitle = windowed
-    ? `Time of day (recorded window ${fmtClock(x0)}\u2013${fmtClock(x1)})`
-    : 'Time of day (h)';
+  const eventName = ANCHOR_EVENT[anchorKey];
+  const axisTitle = solar
+    ? (windowed
+        ? `Hours from ${eventName} (recorded window ${fmtRelHours(toRel(x0))} ` +
+          `to ${fmtRelHours(toRel(x1))})`
+        : `Hours from ${eventName}`)
+    : (windowed
+        ? `Time of day (recorded window ${fmtClock(x0)}\u2013${fmtClock(x1)})`
+        : 'Time of day (h)');
+  // Where the event itself falls, for a guide line the dashed tick marks
+  // would otherwise hide among themselves.
+  const eventX = solar ? (12 - relShift) : null;
 
   const layout = baseLayout({
     height: 430,
@@ -849,7 +977,7 @@ export async function renderActivity(ctx) {
       range: [x0, x1],
       tickmode: 'array',
       tickvals: ticks,
-      ticktext: ticks.map(h => fmtClock(h)),
+      ticktext: ticks.map(h => fmtAxis(h)),
       showgrid: true, gridcolor: '#f1f3f5'
     }),
     yaxis: Object.assign({}, AXIS, {
@@ -863,7 +991,21 @@ export async function renderActivity(ctx) {
     shapes: ticks.filter(h => h > x0 && h < x1).map(h => ({
       type: 'line', x0: h, x1: h, y0: 0, y1: 1, yref: 'paper',
       line: { color: '#e4e7ea', width: 1, dash: 'dash' }, layer: 'below'
-    }))
+    })).concat(
+      (eventX !== null && eventX > x0 && eventX < x1)
+        ? [{
+            type: 'line', x0: eventX, x1: eventX, y0: 0, y1: 1, yref: 'paper',
+            line: { color: '#b58b2e', width: 1.6 }, layer: 'below'
+          }]
+        : []),
+    annotations: (eventX !== null && eventX > x0 && eventX < x1)
+      ? [{
+          x: eventX, y: 0.97, yref: 'paper', yanchor: 'top',
+          xanchor: 'left', xshift: 4,
+          text: eventName, showarrow: false,
+          font: { size: 11, color: '#8a6a1f' }
+        }]
+      : []
   });
 
   clear(container);
@@ -885,7 +1027,7 @@ export async function renderActivity(ctx) {
       s.appendChild(el('span', 'k',
         `${t.plot_type}${t.combined ? ` (${t.n_plot_types})` : ''}: `));
       s.appendChild(el('span', null,
-        `${fmtInt(t.n)} detections, peak ${fmtClock(t.curve.x[peak])}`));
+        `${fmtInt(t.n)} detections, peak ${fmtAxis(t.curve.x[peak])}`));
       stats.appendChild(s);
     }
   }

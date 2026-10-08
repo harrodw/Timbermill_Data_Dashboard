@@ -162,10 +162,11 @@ Half-hour histograms of detection time are smoothed with a Gaussian kernel
 comparable between plot types with very different totals; the totals themselves
 are printed beside the chart and in every hover.
 
-The kernel wraps around midnight **only when the sensor sampled the whole
-clock**. For the cameras it does: a detection at 23:50 is twenty minutes from
-one at 00:10, and a non-circular smoother would invent a trough at midnight.
-For the ARUs it must not — see the next section.
+The kernel wraps around the cycle **only when the sensor sampled the whole of
+it**. For the cameras it does: a detection at 23:50 is twenty minutes from one
+at 00:10, and a non-circular smoother would invent a trough at midnight. For
+the ARUs it must not — see the next section. Under a solar anchor the wrap
+point is 12 hours either side of the event rather than midnight.
 
 Each panel has a **plot-type toggle**. "Separate" draws one curve per plot type;
 "Combined" pools them into a single curve by summing counts *and* effort before
@@ -194,18 +195,33 @@ Effort correction fixes the *shape* of the curve but not its *extent*: dividing
 a handful of midday detections by a handful of midday recording-hours produces
 a noisy, wildly uncertain density across two-thirds of the x-axis that the
 schedule never meant to sample. So the acoustic panel draws only the half-hours
-the recorders actually covered, **17:30 → 08:30** (30 of 48 bins, 15 hours),
-and the x-axis is labelled with that window.
+the recorders actually covered — on the clock that is **17:30 → 09:00** (31 of
+48 bins, 15.5 hours, 94.2% of all recording effort) — and the x-axis is
+labelled with that window.
 
-The window is derived, not typed in. A bin counts as sampled when it carries at
-least 3% of the peak bin's recording effort. That threshold sits inside a wide
-empirical gap rather than being a round number: the daytime plateau never
-exceeds ~2.1% of peak, and no scheduled bin falls below ~3.6%. The resulting
-window holds **93.9% of all recording effort** and 95.8% of detections above
-cutoff.
+The window is derived, not typed in, and it is derived **per anchor** — see the
+next section. Two decisions sit behind it, and they answer different questions:
 
-Two things follow, and both are published in `birdnet.json` so the panel can
-state them rather than hide them:
+1. **Which recordings were on schedule at all.** Settled once, on the clock
+   profile of every recording, where the three effort regimes separate
+   cleanly: a bin carrying at least 3% of the peak bin's effort is scheduled.
+   That threshold sits inside a wide empirical gap rather than being a round
+   number — the daytime plateau never exceeds ~2.1% of peak and no scheduled
+   bin falls below ~3.6%. It identifies **590 off-schedule recordings at four
+   plots** (IF07, TO04, RE05, TO15), and that verdict is a property of the
+   recording, so it is reused unchanged for every anchor.
+2. **Which bins to draw through.** A bin needs at least **20 recording-hours**
+   before a curve is drawn through it. This is an absolute floor, not a share
+   of the peak, because a share of the peak is not anchor-invariant: anchoring
+   on sunset spreads the dawn chorus over the ~3.2 h that night length varies,
+   which lowers the peak without changing a single recording, and a 3% cut
+   then slices through the middle of the smeared dawn bins and truncates the
+   window across the biggest signal in the data. The floor is not knife-edge —
+   anywhere from 15 to 25 h gives the same window to within one bin under all
+   three anchors — and at 20 h each anchor keeps ~94% of all recorded time.
+
+Two further facts are published in `birdnet.json` so the panel can state them
+rather than hide them:
 
 - **The schedule is solar-anchored, not fixed-clock.** The median first file of
   the night moves from 17.9 h in March to 19.6 h in August, tracking sunset.
@@ -213,19 +229,19 @@ state them rather than hide them:
   of **1.4 hours *before* sunset** — not at sunset — and ends a median of 0.5
   hours after sunrise. The published window is the envelope across the whole
   season, so on any individual night the recorder started somewhat inside it.
-- **4.3% of detections fall outside the window and are not drawn.** Every one
-  of them comes from 590 off-schedule daytime recordings at just four plots —
-  IF07, TO04, RE05 and TO15. That was checked at record level, not assumed: of
-  the 73,068 excluded detections in the validated group, 100% trace to those
-  four plots and none to any other. The counts are published as
-  `activity.off_schedule.n_detections_excluded` so the activity panel and the
-  species chart can be reconciled.
+- **About 4% of detections fall outside the window and are not drawn.** Every
+  one of them comes from those 590 off-schedule recordings. That was checked at
+  record level, not assumed: of the 73,068 excluded detections in the validated
+  group under the clock anchor, 100% trace to those four plots and none to any
+  other. Per-anchor counts are published as
+  `activity.anchors.<anchor>.off_schedule.n_detections_excluded` so the
+  activity panel and the species chart can be reconciled.
 
-Because dusk and morning are 14 hours apart rather than adjacent, the smoother
-is **not** wrapped for the acoustic curves; wrapping would smear the dawn
-chorus backwards into the previous evening. The x-axis runs past 24 (17:30 is
-17.5, 08:30 is 32.5) so the night reads left to right as one continuous series,
-and tick labels are rewritten back to clock time.
+Because dusk and morning are some 15 hours apart rather than adjacent, the
+smoother is **not** wrapped for the acoustic curves; wrapping would smear the
+dawn chorus backwards into the previous evening. The x-axis runs past 24 so the
+night reads left to right as one continuous series, and tick labels are
+rewritten into the units of the chosen anchor.
 
 Recording length is inferred per file from the largest detection offset it
 contains. The two scheduled lengths separate cleanly — no file in the dataset
@@ -233,6 +249,51 @@ has a maximum offset between 300 and 310 s — so the inference is safe; the
 residual error is a 60-minute file whose only detections fell in its first few
 minutes, which would be scored short and slightly under-state effort in that
 bin.
+
+## Anchoring activity on sunrise or sunset
+
+Every activity panel has a **Time axis** control: clock time, hours from
+sunrise, or hours from sunset. Clock time asks when in the day an animal was
+active. A solar anchor asks where in the night it was active *relative to the
+light*, which is what most activity is actually keyed to, and which is what
+makes a March detection comparable with an August one — over this season
+sunrise moves 1.81 h and sunset 1.44 h, so a fixed 06:00 on the x-axis is a
+different part of the night in each month.
+
+Solar times come from the NOAA sunrise equation, one value per date, computed
+for the study site (36.13 N, 76.55 W). Across the 50 plots the spread in
+sunrise is a couple of seconds — far inside one half-hour bin — so a single
+site position is used rather than a per-plot calculation implying a precision
+the binning cannot carry.
+
+Each anchor is a **full re-binning of the detections and of the ARU effort**,
+not a relabelled axis. `build_summaries.py` emits three sets of bins per
+species per plot type, and three effort denominators; the frontend picks one.
+The published bins are rotated so bin 24 is the event itself, which makes
+hours-relative-to-event `(bin - 24) / 2` with no wrapping to read.
+
+**The anchors are not interchangeable, and the choice is a real one.** Night
+length runs from 9.38 h to 12.60 h over the season, a spread of 3.22 h.
+Anchoring on one end of the night aligns that end perfectly and smears the
+other by that spread. It shows up directly in the data: with all plot types
+under the sunrise anchor the dawn chorus peaks at **−1.2 h** in every one of
+them, while under the sunset anchor the same peak lands at +8.8 h in two plot
+types and +10.8 h in the third — the disagreement is the smearing, not biology.
+So:
+
+- reading a **dawn** signal (the bird chorus), anchor on sunrise;
+- reading a **dusk** signal (the frog group, which calls at nightfall), anchor
+  on sunset;
+- reading **wall-clock** behaviour, or comparing against something scheduled by
+  the clock, use clock time.
+
+Because the three windows differ, the share of detections outside the drawn
+window differs too (about 4.0%, 4.1% and 4.3%). The panel states the figure for
+the anchor on screen rather than quoting one of them everywhere.
+
+For the cameras, which ran continuously, every anchor samples all 48 bins and
+stays circular; only the meaning of the x-axis changes, and the curve is
+centred on the event at 0 with ±12 h either side.
 
 ## Detection rate and naive occupancy
 
@@ -443,8 +504,12 @@ python3 private/shots.py http://localhost:8000/ private/shots_new
 
 `frontend_check.mjs` runs the dashboard's own selector functions against the
 published summaries and checks the things a glance at the page cannot: that
-every activity curve integrates to 1 over the window it was drawn on, that the
-sampled window is contiguous in clock time, that a windowed curve does *not*
+every activity curve integrates to 1 over the window it was drawn on, that
+re-binning against sunrise or sunset moves detections without creating or
+losing any (checked per file and per species), that each solar window spans
+its own event and that its width matches its bin count, that the three
+anchors' effort arrays total the same recorded hours, that the sampled window
+is contiguous in time, that a windowed curve does *not*
 close at midnight while a fully sampled one does, that the combined curve's
 counts and effort equal the sum of the separate ones, that every plot type
 carrying detections also carries an effort denominator, that per-plot-type
